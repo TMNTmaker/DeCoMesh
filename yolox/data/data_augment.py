@@ -138,6 +138,16 @@ def _mirror(image, boxes, prob=0.5):
         boxes[:, 0::2] = width - boxes[:, 2::-2]
     return image, boxes
 
+def _mirror3D(image, objects, prob=0.5):
+    _, width, _ = image.shape
+    if random.random() < prob:
+        image = image[:, ::-1]
+        objects[:,:, 0] = width - objects[:,:, 0]
+        #for i in range(len(objects)):
+        #    objects[i][:, 0] = width - objects[i][:, 0]
+    return image, objects
+
+
 
 def preproc(img, input_size, swap=(2, 0, 1)):
     if len(img.shape) == 3:
@@ -156,6 +166,65 @@ def preproc(img, input_size, swap=(2, 0, 1)):
     padded_img = padded_img.transpose(swap)
     padded_img = np.ascontiguousarray(padded_img, dtype=np.float32)
     return padded_img, r
+
+class TrainTransform3D:
+    def __init__(self, max_objects=50,max_faces=6,max_vertex=4, flip_prob=0.5, hsv_prob=1.0):
+        self.max_objects = max_objects
+        self.max_faces = max_faces
+        self.max_vertex = max_vertex
+        self.flip_prob = flip_prob
+        self.hsv_prob = hsv_prob
+
+    def __call__(self, image, targets, input_dim):
+        objects = targets.copy()
+        if len(objects) == 0:
+            targets = np.zeros((self.max_objects,self.max_faces,self.max_vertex, 3), dtype=np.float32)
+            image, r_o = preproc(image, input_dim)
+            return image, targets
+
+        image_o = image.copy()
+        targets_o = targets.copy()
+        height_o, width_o, _ = image_o.shape
+        objects_o = targets_o
+
+        if random.random() < self.hsv_prob:
+            augment_hsv(image)
+        image_t, objects = _mirror3D(image, objects, self.flip_prob)
+        height, width, _ = image_t.shape
+        image_t, r_ = preproc(image_t, input_dim)
+        objects *= r_
+        #objects = [obj * r_ for obj in objects]
+        objects_t = objects
+        if len(objects_t) == 0:
+            image_t, r_o = preproc(image_o, input_dim)
+            objects_o *= r_o
+            objects_t = objects_o
+        targets_t = objects_t
+        padded_labels = np.zeros((self.max_objects,self.max_faces,self.max_vertex, 3))
+        padded_labels[range(len(targets_t))[: self.max_objects]] = targets_t[
+            : self.max_objects
+        ]
+        padded_labels = np.ascontiguousarray(padded_labels, dtype=np.float32)
+        return image_t, padded_labels
+
+
+class ValTransform3D:
+
+    def __init__(self, swap=(2, 0, 1), legacy=False):
+        self.swap = swap
+        self.legacy = legacy
+
+    # assume input is cv2 img for now
+    def __call__(self, img, res, input_size):
+        img, _ = preproc(img, input_size, self.swap)
+        if self.legacy:
+            img = img[::-1, :, :].copy()
+            img /= 255.0
+            img -= np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+            img /= np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        return img, np.zeros((1, 3))
+
+
 
 
 class TrainTransform:

@@ -83,7 +83,7 @@ Step1. Download a pretrained model from the benchmark table.
 Step2. Use either -n or -f to specify your detector's config. For example:
 
 ```shell
-python tools/demo.py image -n yolox-s -c /path/to/your/yolox_s.pth --path assets/dog.jpg --conf 0.25 --nms 0.45 --tsize 640 --save_result --device [cpu/gpu]
+python3 tools/demo.py image -n yolov3 -c exps/weight/yolox_darknet.pth --path assets/dog.jpg --conf 0.25 --nms 0.45 --tsize 640 --save_result --device gpu
 ```
 or
 ```shell
@@ -247,3 +247,16 @@ It is hoped that every AI practitioner in the world will stick to the belief of 
 没有孙剑博士的指导，YOLOX也不会问世并开源给社区使用。
 孙剑博士的离去是CV领域的一大损失，我们在此特别添加了这个部分来表达对我们的“船长”孙老师的纪念和哀思。
 希望世界上的每个AI从业者秉持着“持续创新拓展认知边界，非凡科技成就产品价值”的观念，一路向前。
+
+
+---
+
+- train
+
+```
+python tools/train.py -f yolox/exp/yolox3D_base.py -d 1 -b 64 --fp16 -o -c exps/weight/yolox_darknet.pth [--cache]
+
+
+python3 tools/train.py -f exps/example/custom/yolox3d_sun.py -d 1 -b 16 --fp16 -o -c exps/weight/yolox_darknet.pth --cache
+
+```

@@ -1,0 +1,18 @@
+services:
+  yolox3d:
+    shm_size: 16g
+    container_name: yolox3d
+    build: .
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+

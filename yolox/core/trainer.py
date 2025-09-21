@@ -17,6 +17,7 @@ from yolox.utils import (
     MlflowLogger,
     ModelEMA,
     WandbLogger,
+    freeze_module,
     adjust_status,
     all_reduce_norm,
     get_local_rank,
@@ -339,6 +340,8 @@ class Trainer:
                 ckpt_file = self.args.ckpt
                 ckpt = torch.load(ckpt_file, map_location=self.device)["model"]
                 model = load_ckpt(model, ckpt)
+                if self.args.freeze:
+                    freeze_module(model, "backbone")
             self.start_epoch = 0
 
         return model

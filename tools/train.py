@@ -9,7 +9,9 @@ from loguru import logger
 
 import torch
 import torch.backends.cudnn as cudnn
-
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 from yolox.core import launch
 from yolox.exp import Exp, check_exp_value, get_exp
 from yolox.utils import configure_module, configure_nccl, configure_omp, get_num_devices
@@ -45,6 +47,16 @@ def make_parser():
         "--resume", default=False, action="store_true", help="resume training"
     )
     parser.add_argument("-c", "--ckpt", default=None, type=str, help="checkpoint file")
+    
+    parser.add_argument(
+        "-fz",
+        "--freeze",
+        dest="freeze",
+        default=False,
+        action="store_true",
+        help="freeze backbone training.",
+    )
+    
     parser.add_argument(
         "-e",
         "--start_epoch",
