@@ -30,8 +30,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-dev \
     libegl1-mesa-dev \
     libgles2-mesa-dev \
+    libopenblas-dev \
     mesa-utils-extra \
+    libeigen3-dev \
+    libblas-dev\
     python3-pip git nano \
+    python3-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 ENV QT_QPA_PLATFORM=offscreen
 # 環境変数設定
@@ -64,6 +68,17 @@ RUN pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0  --index-url 
 # 必要なパッケージを pip でインストール
 COPY requirements.txt .
 RUN pip install -r requirements.txt
+
+# 
+# kaolinインストール
+#
+RUN git clone --recursive https://github.com/NVIDIAGameWorks/kaolin.git && \
+    cd kaolin && \
+    git checkout v0.15.0 && \
+    pip install .
+
+# 作業ディレクトリ
+WORKDIR /workspace
 
 # ===============================
 # エントリーポイント

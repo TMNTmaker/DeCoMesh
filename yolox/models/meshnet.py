@@ -1,9 +1,5 @@
 import torch
 from torch.nn import Conv2d, Module, ReLU, MaxPool2d, init
-import torch.nn.functional as F
-import numpy as np
-from yolox.utils import postprocess2D
-from yolox.models.losses import multi_shape_boundary_plus_area_loss_2d_batched
 from typing import Tuple
 import time
 class MeshNet(Module):
@@ -12,9 +8,9 @@ class MeshNet(Module):
         self.stage_1 = Stage_1()
         self.stage_2 = Stage_x()
         self.stage_3 = Stage_x()
-        self.stage_4 = Stage_x()
-        self.stage_5 = Stage_x()
-        self.stage_6 = Stage_x()
+        #self.stage_4 = Stage_x()
+        #self.stage_5 = Stage_x()
+        #self.stage_6 = Stage_x()
         for m in self.modules():
             if isinstance(m, Conv2d):
                 init.constant_(m.bias, 0)
@@ -28,12 +24,12 @@ class MeshNet(Module):
         pafs.append(h1)
         h1 = self.stage_3(torch.cat([h1, feature_map], dim = 1))
         pafs.append(h1)
-        h1 = self.stage_4(torch.cat([h1, feature_map], dim = 1))
-        pafs.append(h1)
-        h1 = self.stage_5(torch.cat([h1, feature_map], dim = 1))
-        pafs.append(h1)
-        h1 = self.stage_6(torch.cat([h1, feature_map], dim = 1))
-        pafs.append(h1)
+        #h1 = self.stage_4(torch.cat([h1, feature_map], dim = 1))
+        #pafs.append(h1)
+        #h1 = self.stage_5(torch.cat([h1, feature_map], dim = 1))
+        #pafs.append(h1)
+        #h1 = self.stage_6(torch.cat([h1, feature_map], dim = 1))
+        #pafs.append(h1)
         if self.training:
             assert labels is not None, "labels must be provided during training"
             assert reduction_mag is not None, "reduction_mag must be provided during training"
@@ -195,16 +191,6 @@ class MeshNet(Module):
         
         loss_total = 0
         torch.cuda.synchronize(); t0 = time.time()
-        #groundpolygon_xy = postprocess2D(pafs_t[:,0:4,...],reduction_mag)
-        #groundpolygon_yz = postprocess2D(pafs_t[:,4:8,...],reduction_mag)
-        #groundpolygon_zx = postprocess2D(pafs_t[:,8:12,...],reduction_mag)
-        #torch.cuda.synchronize(); t1 = time.time()
-        #print(f"Ground polygon processing time: {t1-t0:.4f}s")
-
-    
-        
-        blk=0
-        
         
         # compute loss on each stage
         
@@ -264,16 +250,16 @@ class Stage_1(Module):
     def __init__(self):
         super(Stage_1, self).__init__()
         self.conv1_CPM_L1 = Conv2d(in_channels=256, out_channels=128, kernel_size=3, stride=1, padding=1)
-        self.conv2_CPM_L1 = Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
-        self.conv3_CPM_L1 = Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
-        self.conv4_CPM_L1 = Conv2d(in_channels=128, out_channels=512, kernel_size=1, stride=1, padding=0)
-        self.conv5_CPM_L1 = Conv2d(in_channels=512, out_channels=12, kernel_size=1, stride=1, padding=0)
+        #self.conv2_CPM_L1 = Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
+        #self.conv3_CPM_L1 = Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
+        self.conv4_CPM_L1 = Conv2d(in_channels=128, out_channels=256, kernel_size=1, stride=1, padding=0)
+        self.conv5_CPM_L1 = Conv2d(in_channels=256, out_channels=12, kernel_size=1, stride=1, padding=0)
         self.relu = ReLU()
         
     def forward(self, x):
         h1 = self.relu(self.conv1_CPM_L1(x)) # branch1
-        h1 = self.relu(self.conv2_CPM_L1(h1))
-        h1 = self.relu(self.conv3_CPM_L1(h1))
+        #h1 = self.relu(self.conv2_CPM_L1(h1))
+        #h1 = self.relu(self.conv3_CPM_L1(h1))
         h1 = self.relu(self.conv4_CPM_L1(h1))
         h1 = self.conv5_CPM_L1(h1)
         return h1
@@ -282,20 +268,20 @@ class Stage_x(Module):
     def __init__(self):
         super(Stage_x, self).__init__()
         self.conv1_L1 = Conv2d(in_channels = 268, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        self.conv2_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        self.conv3_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        self.conv4_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        self.conv5_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        #self.conv2_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        #self.conv3_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        #self.conv4_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        #self.conv5_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
         self.conv6_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 1, stride = 1, padding = 0)
         self.conv7_L1 = Conv2d(in_channels = 128, out_channels = 12, kernel_size = 1, stride = 1, padding = 0)
         self.relu = ReLU()
         
     def forward(self, x):
         h1 = self.relu(self.conv1_L1(x)) # branch1
-        h1 = self.relu(self.conv2_L1(h1))
-        h1 = self.relu(self.conv3_L1(h1))
-        h1 = self.relu(self.conv4_L1(h1))
-        h1 = self.relu(self.conv5_L1(h1))
+        #h1 = self.relu(self.conv2_L1(h1))
+        #h1 = self.relu(self.conv3_L1(h1))
+        #h1 = self.relu(self.conv4_L1(h1))
+        #h1 = self.relu(self.conv5_L1(h1))
         h1 = self.relu(self.conv6_L1(h1))
         h1 = self.conv7_L1(h1)
         return h1

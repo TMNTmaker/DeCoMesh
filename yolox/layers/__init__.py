@@ -9,6 +9,6 @@ from .jit_ops import FastCOCOEvalOp, JitOp
 
 try:
     from .fast_coco_eval_api import COCOeval_opt
-    from .sunrgb_eval_api import SUNRGBeval_opt
+    from .sunrgb_eval_api import SUNRGBDeval_opt
 except ImportError:  #  exception will be raised when users build yolox from source
     pass

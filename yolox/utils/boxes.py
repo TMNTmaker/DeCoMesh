@@ -19,6 +19,10 @@ __all__ = [
     "xyxy2xywh",
     "xyxy2cxcywh",
     "cxcywh2xyxy",
+    "Box3D",
+    "Det",
+    "GT",
+    "evaluate_sunrgbd_3dIoU_mAP"
 ]
 
 
@@ -77,27 +81,26 @@ def _angle_lt_deg(u: torch.Tensor, v: torch.Tensor):
 def cluster_vectors3D_torch(
     vector_field: torch.Tensor,
     mag: float,
-    threshold_deg: float = 10.0,
-    min_norm: float = 1e-7,
+    min_norm: float = 1e-4,
     merge_radius: float = 1.0,
+    max_sample: int = 1000
 ):
     """
     Args:
-        vector_field: (6, D, H, W)  [offset(z,y,x), target(z,y,x)]
+        vector_field: (9, D, H, W)  [offset(z,y,x),..., target(z,y,x)]
     Returns:
-        vertices: (N, 3)  float (x,y,z) in world coords
-        edges:    (M, 2)  long  [start_idx, end_idx]
+        vertices: (N, 3)  float (x,y,z) in coords
+        faces:    (M, 3)  long  [vertices indicesx 3] triangular faces
         index_map:(D, H, W) long  頂点インデックス（未割当は-1）
     """
     from collections import defaultdict
-    assert vector_field.dim() == 4 and vector_field.size(0) == 9, \
-        "vector_field must be (9,D,H,W)"
+    assert vector_field.dim() == 4 and vector_field.size(0) ==6,\
+        "vector_field must be (6,D,H,W)"
     device = vector_field.device
     _, D, H, W = vector_field.shape
 
     off = vector_field[:3]   # (3,D,H,W): z,y,x
-    normal = vector_field[3:6] # (3,D,H,W): z,y,x
-    tgt = vector_field[6:9]# (3,D,H,W): z,y,x
+    tgt = vector_field[3:]# (3,D,H,W): z,y,x
 
     # 有効ボクセル
     mag_tgt = torch.linalg.norm(tgt, dim=0)  # (D,H,W)
@@ -108,9 +111,13 @@ def cluster_vectors3D_torch(
     
     index_map_tgt = torch.full((D, H, W), -1, dtype=torch.long, device=device)
     length_map_step  = defaultdict(list)
-    vertices_xyz = []
-    edges_ij = []
+    vertices_xyz: list[torch.Tensor] = []
+    edges_ij: list[torch.Tensor] = [] 
 
+    # start_idx(チェーンID) -> そのチェーンで生成した頂点(旧インデックス)集合
+    group2verts = defaultdict(set)
+    
+    
     # 26近傍（GPUテンソル→.item()でPython intに）
     neigh = torch.tensor(
         [[dz, dy, dx] for dz in (-1, 0, 1)
@@ -122,8 +129,8 @@ def cluster_vectors3D_torch(
 
     current_vertex = 0
     seeds = mask_tgt.nonzero(as_tuple=False)  # (N,3) [z,y,x]
-
-    for zyx in seeds:
+    blk=0
+    for zyx in seeds[:max_sample]:
         z0, y0, x0 = int(zyx[0].item()), int(zyx[1].item()), int(zyx[2].item())
         if index_map_tgt[z0, y0, x0] != -1:
             continue
@@ -131,7 +138,6 @@ def cluster_vectors3D_torch(
         # スタート頂点 中点
         m0 = tgt[:, z0, y0, x0]
         m0_grid = torch.tensor([z0, y0, x0], device=device, dtype=off.dtype)
-        np0 = normal[:, z0, y0, x0]
         
         start_idx = current_vertex
 
@@ -220,9 +226,6 @@ def cluster_vectors3D_torch(
                 index_map_tgt[cz_m, cy_m, cx_m] = start_idx
                 n_m+=1
                 
-                
-                
-
             # 進行方向に近いベクトルが見つかったら“終点/始点”とする
             for k in range(neigh.size(0)):
                 nz = cz_p + int(neigh[k, 0].item())
@@ -256,65 +259,165 @@ def cluster_vectors3D_torch(
                 break
         
         #始点頂点
-        o0 = off[:, cz_p, cy_p, cy_p] + 0.5  # (oz,oy,ox)
-        p0_grid = torch.tensor([cz_p, cy_p, cy_p], device=device, dtype=off.dtype)  # (x,y,z)
+        o0 = off[:, cz_p, cy_p, cx_p] + 0.5  # (oz,oy,ox)
+        p0_grid = torch.tensor([cz_p, cy_p, cx_p], device=device, dtype=off.dtype)  # (x,y,z)
         p0_off  = torch.tensor([o0[2], o0[1], o0[0]], device=device, dtype=off.dtype)
         p0 = (p0_grid + p0_off) * mag
         vertices_xyz.append(p0)
-
+        group2verts[start_idx].add(current_vertex)  # 紐づけ
+        v0_old = current_vertex
+        current_vertex += 1
+        
         # 終点頂点
         o1 = off[:, cz_m, cy_m, cx_m] + 0.5
         p1_grid = torch.tensor([cx_m, cy_m, cz_m], device=device, dtype=off.dtype)
         p1_off  = torch.tensor([o1[2], o1[1], o1[0]], device=device, dtype=off.dtype)
         p1 = (p1_grid + p1_off ) * mag
         vertices_xyz.append(p1)
-        
-        end_idx = current_vertex
+        group2verts[start_idx].add(current_vertex)
+        v1_old = current_vertex
         current_vertex += 1
+        
 
         if torch.linalg.norm(p1 - p0) > 1e-6:
-            edges_ij.append(torch.tensor([start_idx, end_idx], device=device, dtype=torch.long))
+            edges_ij.append(torch.tensor([v0_old, v1_old], device=device, dtype=torch.long))
 
-    # 返却（頂点0件でも index_map は (D,H,W) で返す）
+    # === stack
     vertices = torch.stack(vertices_xyz, dim=0) if len(vertices_xyz) > 0 \
-        else torch.empty((0, 3), device=device, dtype=off.dtype)
-
+        else torch.empty((0, 3), device=device, dtype=off.dtype)    
     edges = torch.stack(edges_ij, dim=0) if len(edges_ij) > 0 \
         else torch.empty((0, 2), device=device, dtype=torch.long)
-
+    
+    # === 双方向化
+    def make_bidir_pairs(pairs: torch.Tensor, dedup: bool = True) -> torch.Tensor:
+        """
+        pairs: (M, 2) の long/ints テンソル。例 [[1,2],[3,5],...]
+        戻り値: (M' ,2) 双方向化したペア。例 [[1,2],[2,1],[3,5],[5,3],...]
+        """
+        assert pairs.dim() == 2 and pairs.size(1) == 2
+        rev = pairs[:, [1, 0]]
+        both = torch.cat([pairs, rev], dim=0)
+        if dedup:
+            # 行を辞書式で一意化（GPU可）
+            both = torch.unique(both, dim=0)
+        return both
+    
+    edges_each = make_bidir_pairs(edges)
+    
     # 近接マージ（簡易）
+    keep = torch.ones(vertices.size(0), dtype=torch.bool, device=device)
+    keep_map = {} # 代表 -> 吸収された旧頂点一覧
     if vertices.size(0) > 1 and merge_radius > 0:
-        keep = torch.ones(vertices.size(0), dtype=torch.bool, device=device)
         for i in range(vertices.size(0)):
             if not keep[i]:
                 continue
+            if i + 1 >= vertices.size(0):
+                break
             di = torch.linalg.norm(vertices[i+1:] - vertices[i], dim=1)
             dup = (di < merge_radius).nonzero(as_tuple=False).squeeze(-1)
             if dup.numel() > 0:
                 dup_idxs = dup + (i + 1)
-                if edges.numel() > 0:
-                    for j in dup_idxs:
-                        edges[edges == j] = i
                 keep[dup_idxs] = False
-
+                keep_map[i]=dup_idxs        
+        # 旧→新インデックス
         old2new = torch.full((vertices.size(0),), -1, dtype=torch.long, device=device)
         new_idx = 0
-        for i in range(vertices.size(0)):
-            if keep[i]:
-                old2new[i] = new_idx
-                new_idx += 1
+        if vertices.numel() > 0:
+            new_idx = 0
+            for i in range(vertices.size(0)):
+                if keep[i]:
+                    old2new[i] = new_idx
+                    new_idx += 1
+    # マージ後頂点
+    new_vertices = vertices[keep] if vertices.numel() > 0 else vertices
 
-        vertices = vertices[keep]
-        if edges.numel() > 0:
-            edges = torch.stack([old2new[edges[:, 0]], old2new[edges[:, 1]]], dim=1)
-            mask_valid = edges[:, 0] != edges[:, 1]
-            edges = edges[mask_valid]
-            if edges.numel() > 0:
-                edges = torch.unique(edges, dim=0)
+    # === エッジを新インデックスへリマップ & クリーンアップ
+    if edges_each.numel() > 0:
+        remap = old2new[edges_each]                           # (E,2)
+        valid = (remap[:,0] >= 0) & (remap[:,1] >= 0)
+        remap = remap[valid]
+        remap = remap[remap[:,0] != remap[:,1]]              # 自己ループ除去
+        # ソートして無向エッジ重複を潰す
+        remap_sorted = torch.sort(remap, dim=1).values
+        new_edges = torch.unique(remap_sorted, dim=0)
+    else:
+        new_edges = torch.empty((0,2), dtype=torch.long, device=device)
 
-    return vertices, edges, index_map_tgt
+    # === group2verts をマージ後インデックスへ変換（index_map_tgt の活用）
+    new_group2verts = {}
+    for gid, olds in group2verts.items():
+        mapped = [old2new[o].item() for o in olds if old2new[o] >= 0]
+        if len(mapped) > 0:
+            new_group2verts[gid] = torch.tensor(sorted(set(mapped)), device=device, dtype=torch.long)
 
+    # === 隣接リスト（neighbors_of_i = unique(dst[src==i])）
+    if new_edges.numel() > 0:
+        src = new_edges[:,0]
+        dst = new_edges[:,1]
+        # 双方向化（無向グラフ扱い）
+        src_ud = torch.cat([src, dst], dim=0)
+        dst_ud = torch.cat([dst, src], dim=0)
+    else:
+        src_ud = torch.empty((0,), dtype=torch.long, device=device)
+        dst_ud = torch.empty((0,), dtype=torch.long, device=device)
 
+    def neighbors_of(i: int) -> torch.Tensor:
+        if src_ud.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=device)
+        nbs = dst_ud[src_ud == i]
+        return torch.unique(nbs)
+    def tensor_intersect1d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Return unique sorted intersection of 1D long tensors a, b (device返し)."""
+        if a.numel() == 0 or b.numel() == 0:
+            return torch.empty(0, dtype=a.dtype, device=a.device)
+        # set で高速 & 簡潔（要素数が巨大でなければ十分速い）
+        s = set(a.tolist())
+        s.intersection_update(b.tolist())
+        if not s:
+            return torch.empty(0, dtype=a.dtype, device=a.device)
+        return torch.tensor(sorted(s), dtype=a.dtype, device=a.device)
+
+    # === 三角面検出（3-cycle）
+    faces_list = []
+    Nv = new_vertices.size(0)
+
+    # チェーングループ単位で三角形候補を探索（偽陽性削減）
+    groups = list(new_group2verts.values()) if len(new_group2verts) > 0 else [torch.arange(Nv, device=device)]
+
+    for group in groups:
+        if group.numel() < 3:
+            continue
+        # グループ内のみで探索
+        in_group = torch.zeros(Nv, dtype=torch.bool, device=device)
+        in_group[group] = True
+
+        # i < j < k の順で重複回避
+        for i in group.tolist():
+            Ni = neighbors_of(i)
+            Ni = Ni[in_group[Ni]]           # グループ内に限定
+            Ni = Ni[Ni > i]                 # i より大きい頂点のみ
+            if Ni.numel() < 2:
+                continue
+            # j を走査
+            for j in Ni.tolist():
+                Nj = neighbors_of(j)
+                Nj = Nj[in_group[Nj]]
+                # 共通近傍 k（かつ k > j）を面とする
+                common = Ni[torch.isin(Ni, Nj)]#tensor_intersect1d(Ni, Nj)
+                common = common[common > j]
+                for k in common.tolist():
+                    # 三角形 (i,j,k) を追加
+                    faces_list.append([i, j, k])
+    if len(faces_list) > 0:
+        faces = torch.tensor(faces_list, dtype=torch.long, device=device)
+        # 同一三角形の重複除去（頂点をソートして一意化）
+        faces_sorted = torch.sort(faces, dim=1).values
+        faces = torch.unique(faces_sorted, dim=0)
+    else:
+        faces = torch.empty((0,3), dtype=torch.long, device=device)
+
+    # 返却（必要なら new_edges も返せるが、仕様に合わせて省略可）
+    return new_vertices, faces, index_map_tgt
 
 
 def cluster_vectors2D_torch(
@@ -420,7 +523,7 @@ def cluster_vectors2D_torch(
         # 終点頂点（終端のworld座標 = (grid + offset + target) * mag）
         o1 = off[:, cy, cx]
         t1 = tgt[:, cy, cx]
-        p1_grid = torch.tensor([cx, cy], device=device, dtype=off.dtype)
+        p1_grid = torch.tensor([cy,cx], device=device, dtype=off.dtype)
         p1_off  = torch.tensor([ o1[1], o1[0]], device=device, dtype=off.dtype)
         p1_tgt  = torch.tensor([ t1[1], t1[0]], device=device, dtype=off.dtype)
         p1 = (p1_grid + p1_off + p1_tgt) * mag
@@ -472,8 +575,8 @@ def cluster_vectors2D_torch(
             edges = edges[mask_valid]
             if edges.numel() > 0:
                 edges = torch.unique(edges, dim=0)
-
-    return vertices, edges, index_map
+    faces=[]
+    return vertices, faces, index_map
 
 import math
 import torch.nn.functional as F
@@ -874,23 +977,22 @@ def postprocess3D(
     mag: float,
     threshold_deg: float = 10.0,
     min_norm: float = 1e-4,
-    merge_radius: float = 15.0,
+    merge_radius: float = 10.0,
 ):    
     """
     バッチ版ポストプロセス。各サンプルに対して (vertices, edges, index_map) を返す。
     """  
     
-    assert prediction.dim() == 5 and prediction.size(1) == 9
+    assert prediction.dim() == 5 and prediction.size(1) == 6#9
     outs = []
     for b in range(prediction.size(0)):
         v, e, im = cluster_vectors3D_torch(
             prediction[b],
             mag=mag,
-            threshold_deg=threshold_deg,
             min_norm=min_norm,
             merge_radius=merge_radius,
         )
-        outs.append((v, e, im))
+        outs.append([v, e, im])
     return outs
 
 def postprocess2D(
@@ -1115,3 +1217,180 @@ def cxcywh2xyxy(bboxes):
     bboxes[:, 2] = bboxes[:, 0] + bboxes[:, 2]
     bboxes[:, 3] = bboxes[:, 1] + bboxes[:, 3]
     return bboxes
+
+
+
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Literal
+import math
+import numpy as np
+
+@dataclass
+class Box3D:
+    # center (x,y,z) in meters (camera/worldどちらでもGT/Predで一致していればOK)
+    cx: float; cy: float; cz: float
+    # size along axes (w: x幅, h: y高さ, l: z奥行) [>0]
+    w: float; h: float; l: float
+    # yaw (rad), +y を上とし、y軸回りの回転（右手系）
+    yaw: float
+
+@dataclass
+class Det:
+    box: Box3D
+    score: float
+    label: int           # 0..C-1
+
+@dataclass
+class GT:
+    box: Box3D
+    label: int           # 0..C-1
+    difficult: bool=False  # 使わないなら常にFalse
+
+
+
+
+
+
+
+
+
+# ---------- 幾何ユーティリティ（回転矩形の多角形交差 × 高さ重なり） ----------
+def _rot_rect_xy(cx, cz, w, l, yaw):
+    # XZ 平面の回転矩形の4頂点（反時計回り）
+    c, s = math.cos(yaw), math.sin(yaw)
+    dx, dz = w/2.0, l/2.0
+    corners = np.array([[-dx,-dz],[ dx,-dz],[ dx, dz],[-dx, dz]], dtype=np.float64)
+    R = np.array([[c,-s],[s, c]], dtype=np.float64)
+    rot = (corners @ R.T) + np.array([cx, cz])
+    return rot  # (4,2) [x,z]
+
+def _poly_area(poly: np.ndarray) -> float:
+    if len(poly) < 3: return 0.0
+    x = poly[:,0]; y = poly[:,1]
+    return 0.5*abs(np.dot(x, np.roll(y,-1)) - np.dot(y, np.roll(x,-1)))
+
+def _clip_polygon(subject: np.ndarray, clip: np.ndarray) -> np.ndarray:
+    # Sutherland–Hodgman convex clipper（clipは凸を想定：矩形）
+    def inside(p, a, b):
+        return (b[0]-a[0])*(p[1]-a[1]) - (b[1]-a[1])*(p[0]-a[0]) >= 0
+    def intersect(a1, a2, b1, b2):
+        # 2線分交点
+        x1,y1 = a1; x2,y2 = a2; x3,y3 = b1; x4,y4 = b2
+        den = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
+        if abs(den) < 1e-12: return a2  # parallel → そのまま
+        px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / den
+        py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / den
+        return np.array([px,py], dtype=np.float64)
+
+    output = subject.copy()
+    for i in range(len(clip)):
+        input_list = output
+        if len(input_list)==0: break
+        output = []
+        A = clip[i]; B = clip[(i+1)%len(clip)]
+        S = input_list[-1]
+        for E in input_list:
+            if inside(E, A, B):
+                if not inside(S, A, B):
+                    output.append(intersect(S, E, A, B))
+                output.append(E)
+            elif inside(S, A, B):
+                output.append(intersect(S, E, A, B))
+            S = E
+        output = np.array(output, dtype=np.float64)
+    return output
+
+def iou3d_gravity_aligned(a: Box3D, b: Box3D) -> float:
+    # XZで多角形IoU、Y（高さ）は1D重なり
+    A = _rot_rect_xy(a.cx, a.cz, a.w, a.l, a.yaw)
+    B = _rot_rect_xy(b.cx, b.cz, b.w, b.l, b.yaw)
+    inter_poly = _clip_polygon(A, B)
+    inter_area = _poly_area(inter_poly)
+    area_a = a.w * a.l
+    area_b = b.w * b.l
+    union_area = area_a + area_b - inter_area
+    if union_area <= 0: return 0.0
+
+    # y の重なり（中心と高さから上下端を出す）
+    ay1, ay2 = a.cy - a.h/2.0, a.cy + a.h/2.0
+    by1, by2 = b.cy - b.h/2.0, b.cy + b.h/2.0
+    h_inter = max(0.0, min(ay2, by2) - max(ay1, by1))
+    if h_inter <= 0: return 0.0
+
+    inter_vol = inter_area * h_inter
+    vol_a = area_a * a.h
+    vol_b = area_b * b.h
+    union_vol = vol_a + vol_b - inter_vol
+    if union_vol <= 0: return 0.0
+    return float(inter_vol / union_vol)
+
+# ---------- AP / mAP ----------
+def _compute_ap(rec: np.ndarray, prec: np.ndarray, method: Literal["11point","all"]= "11point") -> float:
+    if method == "11point":
+        ap = 0.0
+        for t in np.linspace(0.0,1.0,11):
+            p = np.max(prec[rec>=t]) if np.any(rec>=t) else 0.0
+            ap += p
+        return ap/11.0
+    # all-points（単調化して台形積分）
+    mrec = np.concatenate(([0.0], rec, [1.0]))
+    mpre = np.concatenate(([0.0], prec, [0.0]))
+    for i in range(mpre.size-1,0,-1):
+        mpre[i-1] = max(mpre[i-1], mpre[i])
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[idx+1]-mrec[idx]) * mpre[idx+1]))
+
+def evaluate_sunrgbd_3dIoU_mAP(
+    preds: Dict[str, List[Det]],
+    gts:   Dict[str, List[GT]],
+    num_classes: int,
+    iou_thresh_list=(0.25, 0.5),
+    ap_method: Literal["11point","all"]="11point",
+) -> Dict[float, Dict[str, float]]:
+    """
+    preds/gts は 画像ID -> [Det] / [GT]
+    戻り値: {thr: {"mAP":..., "AP_per_class[i]":...}}
+    """
+    results = {}
+    img_ids = sorted(set(list(preds.keys()) + list(gts.keys())))
+    for thr in iou_thresh_list:
+        aps = []
+        for c in range(num_classes):
+            # すべての検出（このクラスのみ）を集約
+            dets = []
+            npos = 0
+            gt_used = {}  # (img, idx) -> matched?
+            for img in img_ids:
+                gtc = [i for i in gts.get(img, []) if i.label==c and not i.difficult]
+                npos += len(gtc)
+                for j,_ in enumerate(gtc):
+                    gt_used[(img,j)] = False
+                for d in preds.get(img, []):
+                    if d.label==c:
+                        dets.append((img, d))
+            # スコア降順でマッチング
+            dets.sort(key=lambda x: x[1].score, reverse=True)
+            tp = np.zeros(len(dets), dtype=np.float64)
+            fp = np.zeros(len(dets), dtype=np.float64)
+            for k,(img,d) in enumerate(dets):
+                gtc = [i for i in gts.get(img, []) if i.label==c and not i.difficult]
+                if len(gtc)==0:
+                    fp[k]=1; continue
+                ious = np.array([iou3d_gravity_aligned(d.box, g.box) for g in gtc], dtype=np.float64)
+                m = int(np.argmax(ious)) if ious.size>0 else -1
+                if ious.size>0 and ious[m] >= thr and not gt_used[(img,m)]:
+                    tp[k]=1; gt_used[(img,m)]=True
+                else:
+                    fp[k]=1
+            if npos==0:
+                aps.append(0.0)
+                continue
+            fp = np.cumsum(fp); tp = np.cumsum(tp)
+            rec = tp / npos
+            prec = tp / np.maximum(tp + fp, 1e-12)
+            ap = _compute_ap(rec, prec, ap_method)
+            aps.append(ap)
+        results[thr] = {"mAP": float(np.mean(aps))}
+        for i,ap in enumerate(aps):
+            results[thr][f"AP_per_class{i}"] = float(ap)
+    return results

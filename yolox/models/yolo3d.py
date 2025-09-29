@@ -4,7 +4,7 @@
 
 import torch.nn as nn
 
-from .yolo_head import YOLOXHead
+#from .yolo_head import YOLOXHead
 from .yolo_pafpn import YOLOPAFPN
 
 
@@ -25,7 +25,7 @@ class YOLOx3D(nn.Module):
             loss_2D,loss_offset2D,loss_target_mask2D,pafs= self.meshnet(
                 fpn_outs[0], targets_link,8
             )
-            loss_3D,loss_offset3D,loss_chamfer = self.coordinate3d(
+            loss_3D,loss_offset3D,loss_chamfer,loss_3DIoU = self.coordinate3d(
                 pafs[-1], targets_link,8
             )
             total_loss = loss_2D+ loss_3D 
@@ -40,6 +40,7 @@ class YOLOx3D(nn.Module):
                 "loss_3D" : loss_3D,
                 "loss_offset3D": loss_offset3D,
                 "loss_chamfer": loss_chamfer,
+                "loss_3DIoU": loss_3DIoU,
             }
             
         else:

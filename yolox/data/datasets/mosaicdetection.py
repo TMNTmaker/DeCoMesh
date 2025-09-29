@@ -155,7 +155,7 @@ class MosaicDetection(Dataset):
 
         else:
             self._dataset._input_dim = self.input_dim
-            img, label, img_info, img_id = self._dataset.pull_item(idx)
+            img, label, img_info, img_id,categories,resized_info,cam_info,m3Dboxes = self._dataset.pull_item(idx)
             img, label = self.preproc(img, label, self.input_dim)
             return img, label, img_info, img_id
 

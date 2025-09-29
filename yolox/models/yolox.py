@@ -4,7 +4,7 @@
 
 import torch.nn as nn
 
-from .yolo_head import YOLOXHead
+#from .yolo_head import YOLOXHead
 from .yolo_pafpn import YOLOPAFPN
 
 
@@ -20,7 +20,8 @@ class YOLOX(nn.Module):
         if backbone is None:
             backbone = YOLOPAFPN()
         if head is None:
-            head = YOLOXHead(80)
+            assert False ,f"head is None"
+            #head = YOLOXHead(80)
 
         self.backbone = backbone
         self.head = head

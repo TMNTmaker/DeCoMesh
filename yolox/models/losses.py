@@ -1,11 +1,272 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 # Copyright (c) Megvii Inc. All rights reserved.
-
 import torch
-import torch.nn as nn
-import numpy as np
+from typing import List, Tuple, Optional, Union
 
+TensorLike = Union[torch.Tensor, List, torch.Tensor]
+
+#@torch.no_grad()
+def chamfer_distance(
+    predict: List[List[TensorLike]],
+    ground:  List[List[TensorLike]],
+    *,
+    squared: bool = True,
+    chunk_size: Optional[int] = None,
+    eps: float = 1e-9,
+) -> torch.Tensor:
+    """
+    Symmetric Chamfer Distance between two *batched* point-cloud sets.
+
+    前提:
+      - predict[b][0] が  (Ni, 3) の点群 (float, 任意 Ni)
+      - ground[b][0]  が  (Mi, 3) の点群 (float, 任意 Mi)
+      - バッチ長は同じ (len(predict) == len(ground))
+      - faces 等の他要素は無視（0番目の点群のみ使用）
+
+    Args:
+        predict: list length=B, each = [points: (Ni,3), faces: any, ...]
+        ground : list length=B, each = [points: (Mi,3), faces: any, ...]
+        squared: True の場合は L2^2 を最小化（一般的な設定）
+        chunk_size: メモリ削減のための点群分割サイズ（None なら分割しない）
+        eps: 数値安定用の極小値
+
+    Returns:
+        loss: scalar tensor = 平均Chamfer距離（対称, 全バッチ/全点で平均）
+    """
+    assert len(predict) == len(ground), "predict と ground のバッチ長が異なります"
+    if len(predict) == 0:
+        # 空バッチ
+        device = torch.device("cpu")
+        return torch.tensor(0.0, device=device)
+
+    # device は最初の点群から推定
+    first_pc: torch.Tensor = predict[0][0]
+    device = first_pc.device
+
+    total_sum = torch.tensor(0.0, device=device)
+    total_cnt = torch.tensor(0,    device=device, dtype=torch.long)
+
+    def _pairwise_min_dists_sum(
+        A: torch.Tensor,  # (Na,3)
+        B: torch.Tensor,  # (Nb,3)
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        sum_i min_j ||A_i - B_j||   （または二乗）と、A_i の個数を返す
+        chunk_size を使ってメモリ節約可能
+        """
+        Na = A.shape[0]
+        if Na == 0:
+            return torch.tensor(0.0, device=A.device), 0
+
+        if B.shape[0] == 0:
+            # 相手が空なら、min距離は定義しにくいので 0 とし、カウント0扱いで返す
+            # （= この片側寄与は無視。必要なら大罰則を入れるロジックに変更可）
+            return torch.tensor(0.0, device=A.device), 0
+
+        if chunk_size is None or Na <= chunk_size:
+            # (Na, Nb) の距離行列
+            D = torch.cdist(A, B, p=2)  # L2
+            if squared:
+                D = D * D
+            mins = D.min(dim=1).values  # (Na,)
+            return mins.sum(), Na
+
+        # チャンク分割
+        s = torch.tensor(0.0, device=A.device)
+        cnt = 0
+        for start in range(0, Na, chunk_size):
+            end = min(start + chunk_size, Na)
+            Ach = A[start:end]  # (k,3)
+            D = torch.cdist(Ach, B, p=2)
+            if squared:
+                D = D * D
+            mins = D.min(dim=1).values  # (k,)
+            s += mins.sum()
+            cnt += mins.numel()
+        return s, cnt
+
+    for b in range(len(predict)):
+        pc_pred: torch.Tensor = predict[b][0].to(device).float()
+        pc_gt:   torch.Tensor = ground[b][0].to(device).float()
+
+        # 形状チェック
+        if pc_pred.ndim != 2 or pc_pred.size(-1) != 3:
+            raise ValueError(f"predict[{b}][0] の形状が不正です: {tuple(pc_pred.shape)} (期待: (N,3))")
+        if pc_gt.ndim != 2 or pc_gt.size(-1) != 3:
+            raise ValueError(f"ground[{b}][0] の形状が不正です: {tuple(pc_gt.shape)} (期待: (M,3))")
+
+        # 片方向: pred -> gt
+        s1, c1 = _pairwise_min_dists_sum(pc_pred, pc_gt)
+        # 片方向: gt -> pred
+        s2, c2 = _pairwise_min_dists_sum(pc_gt, pc_pred)
+
+        # 和と点数で重み付き平均（全点での平均）
+        total_sum = total_sum + s1 + s2
+        total_cnt = total_cnt + (c1 + c2)
+
+    if total_cnt.item() == 0:
+        # すべてが空などの場合
+        return torch.tensor(0.0, device=device)
+
+    loss = total_sum / (total_cnt.to(total_sum.dtype) + eps)
+    return loss
+
+def IoU3D_voxel(
+    predict: List[List[TensorLike]],
+    ground:  List[List[TensorLike]],
+    grid_size: int = 32,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    3D IoU (voxel近似版)
+    Args:
+        predict: list length=B, each = [vertices: (Ni,3), faces: (Mi,3), ...]
+        ground : list length=B, each = [vertices: (Oi,3), faces: (Pi,3), ...]
+        grid_size: ボクセル解像度
+    Returns:
+        iou:  (B,) tensor
+        loss: (B,) tensor = 1 - iou
+    """
+    def voxelize_mesh(vertices: torch.Tensor, faces: torch.Tensor, grid_size: int = 32) -> torch.Tensor:
+        """
+        Voxelize mesh (approximation: rasterize triangles into voxel grid).
+        Args:
+            vertices: (B, N, 3) vertex positions in [0,1] cube
+            faces:    (B, M, 3) triangle faces (indices into vertices)
+            grid_size: resolution of voxel grid
+        Returns:
+            voxels: (B, grid_size, grid_size, grid_size) bool occupancy grid
+        """
+        B, N, _ = vertices.shape
+        voxels = torch.zeros((B, grid_size, grid_size, grid_size), dtype=torch.bool, device=vertices.device)
+
+        # normalize vertices to grid coordinates
+        verts_grid = (vertices * (grid_size - 1)).long()
+
+        for b in range(B):
+            v = verts_grid[b]  # (N,3)
+            f = faces[b]       # (M,3)
+            for tri in f:
+                pts = v[tri]  # (3,3)
+                # bounding box of triangle
+                min_xyz = torch.clamp(pts.min(dim=0).values, 0, grid_size - 1)
+                max_xyz = torch.clamp(pts.max(dim=0).values, 0, grid_size - 1)
+
+                # fill inside bounding box (coarse, not exact triangle fill)
+                xs = torch.arange(min_xyz[0], max_xyz[0]+1, device=vertices.device)
+                ys = torch.arange(min_xyz[1], max_xyz[1]+1, device=vertices.device)
+                zs = torch.arange(min_xyz[2], max_xyz[2]+1, device=vertices.device)
+                xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing="ij")
+                voxels[b, xx, yy, zz] = True
+
+        return voxels
+    assert len(predict) == len(ground), "バッチ長が一致していません"
+    B = len(predict)
+    if B == 0:
+        return torch.tensor([]), torch.tensor([])
+
+    device = predict[0][0].device
+    ious, losses = [], []
+
+    for b in range(B):
+        verts_pred = predict[b][0].to(device).float()
+        faces_pred = predict[b][1].to(device).long()
+        verts_gt   = ground[b][0].to(device).float()
+        faces_gt   = ground[b][1].to(device).long()
+
+        vox_pred = voxelize_mesh(verts_pred, faces_pred, grid_size)
+        vox_gt   = voxelize_mesh(verts_gt, faces_gt, grid_size)
+
+        inter = torch.logical_and(vox_pred, vox_gt).sum().float()
+        union = torch.logical_or(vox_pred, vox_gt).sum().float()
+        iou = inter / (union + eps)
+        loss = 1.0 - iou
+
+        ious.append(iou)
+        losses.append(loss)
+
+    return torch.stack(ious), torch.stack(losses)
+import torch
+from typing import List, Tuple, Union
+from pytorch3d.structures import Meshes
+from pytorch3d.ops import sample_points_from_meshes
+
+# Kaolin
+from kaolin.ops.mesh import check_sign  # NOTE: kaolin ソースビルド済みを想定
+
+
+def IoU3D(
+    predict: List[List[TensorLike]],
+    ground:  List[List[TensorLike]],
+    *,
+    num_samples: int = 5000,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Kaolin の check_sign による 3D IoU（サンプリング近似）。
+    - predict[b] = [verts:(Ni,3), faces:(Mi,3), ...]
+    - ground[b]  = [verts:(Oi,3), faces:(Pi,3), ...]
+    - PyTorch3D で各メッシュ表面から num_samples 点をサンプリング
+    - Kaolin の check_sign で inside/outside を判定して IoU を計算
+      （※ メッシュは概ね watertight 前提。非多様体や開いたメッシュでは誤判定の可能性）
+
+    Returns:
+        iou:  (B,)  各バッチの IoU
+        loss: (B,)  1 - IoU  （学習用に返すが、関数自体は非微分的と考えてください）
+    """
+    assert len(predict) == len(ground), "predict と ground のバッチ長が異なります。"
+    B = len(predict)
+    if B == 0:
+        return torch.tensor([]), torch.tensor([])
+
+    device = predict[0][0].device
+    ious, losses = [], []
+
+    for b in range(B):
+        v_pred: torch.Tensor = predict[b][0].to(device).float()  # (Ni,3)
+        f_pred: torch.Tensor = predict[b][1].to(device).long()   # (Mi,3)
+        v_gt:   torch.Tensor = ground[b][0].to(device).float()   # (Oi,3)
+        f_gt:   torch.Tensor = ground[b][1].to(device).long()    # (Pi,3)
+        if v_pred.numel() == 0 or f_pred.numel() == 0 or v_gt.numel() == 0 or f_gt.numel() == 0:
+            ious.append(torch.tensor(0.0, device=device))
+            losses.append(torch.tensor(1.0, device=device))
+            continue
+        # PyTorch3D Meshes へ（サンプリング用）
+        mesh_pred = Meshes(verts=[v_pred], faces=[f_pred])
+        mesh_gt   = Meshes(verts=[v_gt],   faces=[f_gt])
+
+        # メッシュ表面から点をサンプリング（均等面積サンプリング）
+        pts_pred = sample_points_from_meshes(mesh_pred, num_samples=num_samples)  # (1, S, 3)
+        pts_gt   = sample_points_from_meshes(mesh_gt,   num_samples=num_samples)  # (1, S, 3)
+
+        # 判定対象の点集合（両者のサンプルを連結）
+        all_pts = torch.cat([pts_pred, pts_gt], dim=1).squeeze(0)  # (2S, 3)
+
+        # Kaolin の check_sign は (B,V,3), (B,F,3), (B,P,3) を受ける想定
+        v_pred_b = v_pred.unsqueeze(0)  # (1,Ni,3)
+        f_pred_b = f_pred.unsqueeze(0)  # (1,Mi,3)
+        v_gt_b   = v_gt.unsqueeze(0)    # (1,Oi,3)
+        f_gt_b   = f_gt.unsqueeze(0)    # (1,Pi,3)
+        pts_b    = all_pts.unsqueeze(0) # (1,2S,3)
+
+        # inside 判定（bool）
+        inside_pred: torch.Tensor = check_sign(v_pred_b, f_pred_b, pts_b)[0]  # (2S,)
+        inside_gt:   torch.Tensor = check_sign(v_gt_b,   f_gt_b,   pts_b)[0]  # (2S,)
+
+        inter = torch.sum(inside_pred & inside_gt).float()
+        union = torch.sum(inside_pred | inside_gt).float()
+
+        iou = inter / (union + eps)
+        loss = 1.0 - iou
+        ious.append(iou)
+        losses.append(loss)
+
+    return torch.stack(ious).mean(), torch.stack(losses).mean()
+
+
+
+"""
 # ---------------- Graph utils ----------------
 def split_connected_components(V: int, edges: torch.Tensor):
     e = edges.long()
@@ -332,11 +593,10 @@ def multi_shape_boundary_plus_area_loss_3d_batched(
         raise ValueError("reduction must be 'mean' | 'sum' | 'none'")
 
 def group_rings_outer_holes_2d(rings: list):
-    """
-    外枠/穴を自動仕分け。
-    規約: outer=CCW(面積>0), hole=CW(面積<0) に正規化しつつ、包含関係で決定。
-    return: List[ [outer, hole1, ...] ]   複数“ドーナツ”に分割
-    """
+    
+    #外枠/穴を自動仕分け。
+    #規約: outer=CCW(面積>0), hole=CW(面積<0) に正規化しつつ、包含関係で決定。
+    #return: List[ [outer, hole1, ...] ]   複数“ドーナツ”に分割
     areas = torch.tensor([signed_area_2d(r) for r in rings])
     order = torch.argsort(-areas.abs())  # 大きい順
     rings = list(rings)
@@ -363,7 +623,7 @@ def group_rings_outer_holes_2d(rings: list):
     return groups
 
 def polygon_area_with_holes_2d(group: list) -> torch.Tensor:
-    """outer(CLW正規化済)=正, holes=負 として合算の絶対値"""
+    #outer(CLW正規化済)=正, holes=負 として合算の絶対値
     A = torch.tensor(0.0, device=group[0].device)
     for k,r in enumerate(group):
         s = signed_area_2d(r)
@@ -528,9 +788,6 @@ def multi_shape_boundary_plus_area_loss_2d_batched(
     else:
         raise ValueError("reduction must be 'mean' | 'sum' | 'none'")
 
-
-
-
 def loss_polygon_iou(
         pred: torch.Tensor,   # (N, K, 2) 頂点は順序付き（凸/凹OK）
         target: torch.Tensor, # (N, M, 2)
@@ -540,11 +797,10 @@ def loss_polygon_iou(
         eps: float = 1e-7
     ):
         def _segment_distance(p, a, b, eps=1e-12):
-            """
-            p: (..., 2) 点
-            a,b: (..., E, 2) 辺の端点
-            返り値: (..., E) 各辺までの最近接距離
-            """
+            #p: (..., 2) 点
+            #a,b: (..., E, 2) 辺の端点
+            #返り値: (..., E) 各辺までの最近接距離
+            
             ab = b - a                             # (..., E, 2)
             ap = p.unsqueeze(-2) - a               # (..., E, 2)
             ab2 = (ab ** 2).sum(-1).clamp_min(eps) # (..., E)
@@ -555,11 +811,11 @@ def loss_polygon_iou(
             return d
 
         def _winding_number(p, poly, eps=1e-12):
-            """
-            p: (..., 2)
-            poly: (..., K, 2) 連続順（CW/CCWどちらでも）
-            返り値: (...,) 実数の巻き数（insideなら ≈ ±2π、outsideなら≈0）
-            """
+            
+            #p: (..., 2)
+            #poly: (..., K, 2) 連続順（CW/CCWどちらでも）
+            #返り値: (...,) 実数の巻き数（insideなら ≈ ±2π、outsideなら≈0）
+            
             v1 = poly
             v2 = torch.roll(poly, shifts=-1, dims=-2)
             a = v1 - p.unsqueeze(-2)   # (..., K, 2)
@@ -571,11 +827,11 @@ def loss_polygon_iou(
             return ang.sum(dim=-1)
 
         def _signed_distance(points, poly):
-            """
-            points: (G*G, 2)  [0,1] 正規化座標を想定
-            poly:   (K, 2)
-            返り値: (G*G,) SDF（内側を負、外側を正）
-            """
+            
+            #points: (G*G, 2)  [0,1] 正規化座標を想定
+            #poly:   (K, 2)
+            #返り値: (G*G,) SDF（内側を負、外側を正）
+            
             K = poly.shape[-2]
             a = poly
             b = torch.roll(poly, shifts=-1, dims=-2)
@@ -678,3 +934,4 @@ class IOUloss(nn.Module):
             loss = loss.sum()
 
         return loss
+"""

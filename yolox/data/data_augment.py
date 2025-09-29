@@ -168,7 +168,7 @@ def preproc(img, input_size, swap=(2, 0, 1)):
     return padded_img, r
 
 class TrainTransform3D:
-    def __init__(self, max_objects=50,max_faces=6,max_vertex=4, flip_prob=0.5, hsv_prob=1.0):
+    def __init__(self, max_objects=50,max_faces=44,max_vertex=24, flip_prob=0.5, hsv_prob=1.0):
         self.max_objects = max_objects
         self.max_faces = max_faces
         self.max_vertex = max_vertex
@@ -200,11 +200,18 @@ class TrainTransform3D:
             objects_o *= r_o
             objects_t = objects_o
         targets_t = objects_t
-        padded_labels = np.zeros((self.max_objects,self.max_faces,self.max_vertex, 3))
+        padded_labels = np.zeros((self.max_objects, self.max_faces, self.max_vertex, 3), dtype=np.float32)
         padded_labels[range(len(targets_t))[: self.max_objects]] = targets_t[
             : self.max_objects
         ]
-        padded_labels = np.ascontiguousarray(padded_labels, dtype=np.float32)
+        #num_objects = min(len(targets_t), self.max_objects)
+        ## Pad or crop targets_t to (num_objects, self.max_faces, self.max_vertex, 3)
+        #for i in range(num_objects):
+        #    obj = targets_t[i]
+        #    faces = min(obj.shape[0], self.max_faces)
+        #    verts = min(obj.shape[1], self.max_vertex)
+        #    padded_labels[i, :faces, :verts, :] = obj[:faces, :verts, :]
+        #padded_labels = np.ascontiguousarray(padded_labels, dtype=np.float32)
         return image_t, padded_labels
 
 

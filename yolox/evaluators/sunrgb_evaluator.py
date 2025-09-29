@@ -2,15 +2,10 @@
 # -*- coding:utf-8 -*-
 # Copyright (c) Megvii, Inc. and its affiliates.
 
-import contextlib
-import io
-import itertools
-import json
-import tempfile
 import time
-from collections import ChainMap, defaultdict
+from collections import  defaultdict
 from loguru import logger
-from tabulate import tabulate
+from typing import List, Dict
 from tqdm import tqdm
 
 import numpy as np
@@ -19,56 +14,16 @@ import torch
 
 
 from yolox.utils import (
-    gather,
     is_main_process,
-    postprocess,
-    postprocess3D,
     synchronize,
     time_synchronized,
-    xyxy2xywh
+    Box3D,Det,GT
 )
 
 
-def per_class_AR_table(sunrgb_eval, headers=["class", "AR"], colums=6):
-    per_class_AR = {}
-    recalls = sunrgb_eval.eval["recall"]
 
 
-    recall = recalls[:, 0, -1]
-    recall = recall[recall > -1]
-    ar = np.mean(recall) if recall.size else float("nan")
-    per_class_AR["objects"] = float(ar * 100)
-
-    num_cols = min(colums, len(per_class_AR) * len(headers))
-    result_pair = [x for pair in per_class_AR.items() for x in pair]
-    row_pair = itertools.zip_longest(*[result_pair[i::num_cols] for i in range(num_cols)])
-    table_headers = headers * (num_cols // len(headers))
-    table = tabulate(
-        row_pair, tablefmt="pipe", floatfmt=".3f", headers=table_headers, numalign="left",
-    )
-    return table
-
-
-def per_class_AP_table(sunrgb_eval, headers=["class", "AP"], colums=6):
-    per_class_AP = {}
-    precisions = sunrgb_eval.eval["precision"]
-
-    precision = precisions[:, :, 0, -1]
-    precision = precision[precision > -1]
-    ap = np.mean(precision) if precision.size else float("nan")
-    per_class_AP["objects"] = float(ap * 100)
-
-    num_cols = min(colums, len(per_class_AP) * len(headers))
-    result_pair = [x for pair in per_class_AP.items() for x in pair]
-    row_pair = itertools.zip_longest(*[result_pair[i::num_cols] for i in range(num_cols)])
-    table_headers = headers * (num_cols // len(headers))
-    table = tabulate(
-        row_pair, tablefmt="pipe", floatfmt=".3f", headers=table_headers, numalign="left",
-    )
-    return table
-
-
-class SUNRGBEvaluator:
+class SUNRGBDEvaluator:
     """
     SUNRGB AP Evaluation class.  All the data in the val2017 dataset are processed
     and evaluated by SUNRGB.
@@ -101,13 +56,97 @@ class SUNRGBEvaluator:
         self.per_class_AP = per_class_AP
         self.per_class_AR = per_class_AR
 
+    def image_to_world(self,vertices_img, K, Rt_inv):
+        """
+        vertices_img: (N,3) 投影後の画像座標 (u,v,z)
+            u,v: pixel, z: depth (同じ座標系で)
+        return: (N,3) world座標
+        """
+        N = vertices_img.shape[0]
+        homo = np.concatenate([vertices_img[:,:2], np.ones((N,1))], axis=1)  # (u,v,1)
+        z = vertices_img[:,2:3]  # depth
+        K_inv = np.linalg.inv(K)
+        cam = (K_inv @ homo.T) * z.T  # (3,N)
+        cam_h = np.vstack([cam, np.ones((1,N))])
+        world = (Rt_inv @ cam_h).T[:,:3]
+        return world
+
+
+
+
+    def connected_components(self,vertices: np.ndarray, faces: np.ndarray) -> List[np.ndarray]:
+        """
+        vertices: (N,3)
+        faces: (M,3) 頂点インデックス
+        return: list of index arrays (それぞれの成分に属する頂点インデックス)
+        """
+        # 隣接リストを構築
+        adj = defaultdict(set)
+        for f in faces:
+            i, j, k = f
+            adj[i].update([j,k])
+            adj[j].update([i,k])
+            adj[k].update([i,j])
+
+        visited = np.zeros(len(vertices), dtype=bool)
+        components = []
+
+        for v in range(len(vertices)):
+            if visited[v]:
+                continue
+            # BFS/DFSで1成分を収集
+            stack = [v]
+            comp = []
+            while stack:
+                cur = stack.pop()
+                if visited[cur]:
+                    continue
+                visited[cur] = True
+                comp.append(cur)
+                for nei in adj[cur]:
+                    if not visited[nei]:
+                        stack.append(nei)
+            components.append(np.array(comp, dtype=np.int64))
+        return components
+
+    def mesh_to_3dbox_multi(self,vertices_world: np.ndarray, faces: np.ndarray) -> List[Box3D]:
+        """
+        vertices_world: (N,3) world座標に変換済み頂点群（複数オブジェクト混在可）
+        faces: (M,3) 各三角形の頂点インデックス
+        return: list of Box3D
+        """
+        comps = self.connected_components(vertices_world, faces)
+        boxes = []
+        for comp in comps:
+            verts_sub = vertices_world[comp]
+
+            # AABB
+            min_xyz = verts_sub.min(axis=0)
+            max_xyz = verts_sub.max(axis=0)
+            center = (min_xyz + max_xyz) / 2
+            size = (max_xyz - min_xyz)
+
+            # yaw を PCA (XZ 平面)
+            pts_xz = verts_sub[:,[0,2]] - verts_sub[:,[0,2]].mean(0)
+            cov = np.cov(pts_xz.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            main_axis = eigvecs[:,np.argmax(eigvals)]
+            yaw = np.arctan2(main_axis[1], main_axis[0])  # rad
+
+            boxes.append(Box3D(
+                float(center[0]), float(center[1]), float(center[2]),
+                float(size[0]), float(size[1]), float(size[2]),
+                float(yaw)
+            ))
+        return boxes
+    
+    
     def evaluate(
-        self, model, distributed=False, half=False, trt_file=None,
-        decoder=None, test_size=None, return_outputs=False
+        self, model,  half=False,  return_outputs=False
     ):
         """
-        COCO average precision (AP) Evaluation. Iterate inference on the test dataset
-        and the results are evaluated by COCO API.
+        SUNRGBD average precision (AP) Evaluation. Iterate inference on the test dataset
+        and the results are evaluated by SUNRGBD API.
 
         NOTE: This function will change training mode to False, please save states if needed.
 
@@ -115,8 +154,8 @@ class SUNRGBEvaluator:
             model : model to evaluate.
 
         Returns:
-            ap50_95 (float) : COCO AP of IoU=50:95
-            ap50 (float) : COCO AP of IoU=50
+            mAp25 (float) : SUNRGBD AP of 3DIoU=25
+            mAp50 (float) : SUNRGBD AP of 3DIoU=50
             summary (sr): summary info of evaluation.
         """
         # TODO half to amp_test
@@ -126,24 +165,15 @@ class SUNRGBEvaluator:
             model = model.half()
         ids = []
         data_list = []
-        output_data = defaultdict()
+        sunrgbdDt = defaultdict(Dict[str, List[Det]])
+        sunrgbdGt = defaultdict(Dict[str, List[GT]])
         progress_bar = tqdm if is_main_process() else iter
 
         inference_time = 0
-        nms_time = 0
         n_samples = max(len(self.dataloader) - 1, 1)
 
-        if trt_file is not None:
-            from torch2trt import TRTModule
-
-            model_trt = TRTModule()
-            model_trt.load_state_dict(torch.load(trt_file))
-
-            x = torch.ones(1, 3, test_size[0], test_size[1]).cuda()
-            model(x)
-            model = model_trt
-
-        for cur_iter, (imgs, _, info_imgs, ids) in enumerate(
+        for cur_iter, (imgs, targets, info_imgs, ids,
+                       categories,resize_coefes,cam_infoes,m3Dboxes) in enumerate(
             progress_bar(self.dataloader)
         ):
             with torch.no_grad():
@@ -155,96 +185,83 @@ class SUNRGBEvaluator:
                     start = time.time()
 
                 outputs = model(imgs)
-                if decoder is not None:
-                    outputs = decoder(outputs, dtype=outputs.type())
 
                 if is_time_record:
                     infer_end = time_synchronized()
                     inference_time += infer_end - start
 
-                outputs = postprocess3D(
-                    outputs, self.num_classes, self.confthre, self.nmsthre
-                )
-                if is_time_record:
-                    nms_end = time_synchronized()
-                    nms_time += nms_end - infer_end
-
-            data_list_elem, image_wise_data = self.convert_to_sunrgb_format(
-                outputs, info_imgs, ids, return_outputs=True)
+            data_list_elem, sunrgbdDt_elem, sunrgbdGt_elem = self.convert_to_sunrgb_format(
+                outputs, info_imgs, ids,
+                categories,resize_coefes,cam_infoes,m3Dboxes, 
+                return_outputs=True)
             data_list.extend(data_list_elem)
-            output_data.update(image_wise_data)
-
+            sunrgbdDt.update(sunrgbdDt_elem)
+            sunrgbdGt.update(sunrgbdGt_elem)
         statistics = torch.cuda.FloatTensor([inference_time, n_samples])
-        if distributed:
-            # different process/device might have different speed,
-            # to make sure the process will not be stucked, sync func is used here.
-            synchronize()
-            data_list = gather(data_list, dst=0)
-            output_data = gather(output_data, dst=0)
-            data_list = list(itertools.chain(*data_list))
-            output_data = dict(ChainMap(*output_data))
-            torch.distributed.reduce(statistics, dst=0)
 
-        eval_results = self.evaluate_prediction(data_list, statistics)
+        eval_results = self.evaluate_prediction(sunrgbdGt, sunrgbdDt, statistics)
         synchronize()
 
         if return_outputs:
-            return eval_results, output_data
+            return eval_results, data_list
         return eval_results
 
-    def convert_to_sunrgb_format(self, outputs, info_imgs, ids, return_outputs=False):
+    def convert_to_sunrgb_format(self, outputs, info_imgs, ids,
+                                 categories,resize_coefes,cam_infoes,m3Dboxes):
         data_list = []
-        image_wise_data = defaultdict(dict)
-        for (output, img_h, img_w, img_id) in zip(
-            outputs, info_imgs[0], info_imgs[1], ids
+        sunrgbdDt = defaultdict(Dict[str, List[Det]])
+        sunrgbdGt = defaultdict(Dict[str, List[GT]])
+        for (output, info_img, img_id,gt_category,resize_coef,cam_info,gt_m3Dboxes) in zip(
+            outputs, info_imgs, ids,
+            categories,resize_coefes,cam_infoes,m3Dboxes
         ):
             if output is None:
                 continue
             output = output.cpu()
-
-            objects = output[:, 0]
+            
+            virtex_world = self.image_to_world(self,output[:,0]/resize_coef, 
+                                cam_info["intrinsics"], 
+                                cam_info["extrinsics"])
+            pred_3dboxes = self.mesh_to_3dbox(virtex_world)
+            
 
             # preprocessing: resize
-            scale = min(
-                self.img_size[0] / float(img_h), self.img_size[1] / float(img_w)
-            )
-            objects /= scale
-            cls = ["mesh"]*len(output)#output[:, 6]
-            scores = [1]*len(output)
+            labels = [37]*len(pred_3dboxes) # dummy 37=others
+            scores = [1.0]*len(pred_3dboxes)#dummy
 
-            image_wise_data.update({
-                int(img_id): {
-                    "objects": [box.numpy().tolist() for box in objects],
-                    "scores": [score.numpy().item() for score in scores],
-                    "categories": [
-                        self.dataloader.dataset.class_ids[int(cls[ind])]
-                        for ind in range(objects.shape[0])
-                    ],
-                }
-            })
 
-            for ind in range(objects.shape[0]):
-                label = self.dataloader.dataset.class_ids[int(cls[ind])]
+            for ind in range(pred_3dboxes.shape[0]):
+                label = self.dataloader.dataset.class_ids[int(labels[ind])]
                 pred_data = {
                     "image_id": int(img_id),
                     "category_id": label,
-                    "object": objects[ind].numpy().tolist(),
-                    "score": scores[ind].numpy().item(),
-                    "segmentation": [],
-                }  # COCO json format
+                    "object": pred_3dboxes[ind],
+                    "score": float(scores[ind]),
+                }  # for SUNRGBD json format
                 data_list.append(pred_data)
 
-        if return_outputs:
-            return data_list, image_wise_data
-        return data_list
+            sunrgbdDt.update({
+                str(img_id): {Det: [
+                    Det(label=int(self.dataloader.dataset.class_ids[int(labels[ind])]),
+                        box=pred_3dboxes[ind],
+                        score=float(scores[ind])) for ind in range(pred_3dboxes.shape[0])
+                ]}})
+            
+            sunrgbdGt.update({
+                str(img_id): {GT: [
+                    GT(label=int(self.dataloader.dataset.class_ids[int(gt_category[ind])]),
+                       box=gt_m3Dboxes[ind]) for ind in range(gt_m3Dboxes.shape[0])
+                ]}})
+            
+        return data_list, sunrgbdDt,sunrgbdGt
 
-    def evaluate_prediction(self, data_dict, statistics):
+    def evaluate_prediction(self, sunrgbdGt, sunrgbdDt, statistics):
         if not is_main_process():
             return 0, 0, None
 
         logger.info("Evaluate in main process...")
 
-        annType = ["mesh"]
+        annType = ["mesh","3DIoU"]
 
         inference_time = statistics[0].item()
         n_samples = statistics[1].item()
@@ -264,29 +281,8 @@ class SUNRGBEvaluator:
         info = time_info + "\n"
 
         # Evaluate the Dt (detection) json comparing with the ground truth
-        if len(data_dict) > 0:
-            sunrgbGt = self.dataloader.dataset.sunrgb
+        from yolox.layers import SUNRGBDeval_opt as SUNRGBDeval
 
-            if self.testdev:
-                json.dump(data_dict, open("./yolox_testdev_2017.json", "w"))
-                sunrgbDt = sunrgbGt.loadRes("./yolox_testdev_2017.json")
-            else:
-                _, tmp = tempfile.mkstemp()
-                json.dump(data_dict, open(tmp, "w"))
-                sunrgbDt = sunrgbGt.loadRes(tmp)
-            from yolox.layers import SUNRGBeval_opt as SUNRGBeval
-
-            sunrgbEval = SUNRGBeval(sunrgbGt, sunrgbDt, annType[0])
-            sunrgbEval.accumulate()
-
-            #cat_ids = list(cocoGt.cats.keys())
-            #cat_names = [cocoGt.cats[catId]['name'] for catId in sorted(cat_ids)]
-            #if self.per_class_AP:
-            #    AP_table = per_class_AP_table(cocoEval, class_names=cat_names)
-            #    info += "per class AP:\n" + AP_table + "\n"
-            #if self.per_class_AR:
-            #    AR_table = per_class_AR_table(cocoEval, class_names=cat_names)
-            #    info += "per class AR:\n" + AR_table + "\n"
-            return sunrgbEval.stats[0], sunrgbEval.stats[1], info
-        else:
-            return 0, 0, info
+        sunrgbdEval = SUNRGBDeval(sunrgbdGt, sunrgbdDt, annType[1])
+        sunrgbdEval.accumulate()
+        return sunrgbdEval.stats[0], sunrgbdEval.stats[1], info

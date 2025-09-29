@@ -19,7 +19,7 @@ class Exp(BaseExp):
 
         # ---------------- model config ---------------- #
         # detect classes number of model
-        self.num_classes = 80
+        self.num_classes = 38#18
         # factor of model depth
         self.depth = 1.00
         # factor of model width
@@ -42,7 +42,7 @@ class Exp(BaseExp):
         # name of annotation file for training
         self.train_ann = "train_anno.json"
         # name of annotation file for evaluation
-        self.val_ann = "eval_anno.json"
+        self.val_ann = "test_anno.json"
         # name of annotation file for testing
         #self.test_ann = "instances_test2017.json"
 
@@ -118,7 +118,7 @@ class Exp(BaseExp):
 
         if getattr(self, "model", None) is None:
             #in_channels = [256, 512, 1024]
-            backbone = YOLOPAFPN(self.depth, self.width,in_channels = [256, 512, 1024])#self.depth, self.width, in_channels=in_channels, act=self.act)
+            backbone = YOLOPAFPN(self.depth, self.width,in_channels = [256, 512, 1024])#[256, 512, 1024])#self.depth, self.width, in_channels=in_channels, act=self.act)
             meshnet = MeshNet()
             coordinate3d = TriView2CoordGrid()
             self.model = YOLOx3D(backbone,meshnet,coordinate3d)
@@ -137,16 +137,16 @@ class Exp(BaseExp):
                 "ram" : Caching imgs to ram for fast training.
                 "disk": Caching imgs to disk for fast training.
         """
-        from yolox.data import SUNRGBDataset, TrainTransform3D
+        from yolox.data import SUNRGBDDataset, TrainTransform3D
 
-        return SUNRGBDataset(
+        return SUNRGBDDataset(
             data_dir=self.data_dir,
             json_file=self.train_ann,
             img_size=self.input_size,
             preproc=TrainTransform3D(
                 max_objects=20,
                 max_faces=6,
-                max_vertex=8,
+                max_vertex=4,
                 flip_prob=self.flip_prob,
                 hsv_prob=self.hsv_prob
             ),
@@ -303,11 +303,11 @@ class Exp(BaseExp):
         return scheduler
 
     def get_eval_dataset(self, **kwargs):
-        from yolox.data import SUNRGBDataset, ValTransform3D
+        from yolox.data import SUNRGBDDataset, ValTransform3D
         testdev = kwargs.get("testdev", False)
         legacy = kwargs.get("legacy", False)
 
-        return SUNRGBDataset(
+        return SUNRGBDDataset(
             data_dir=self.data_dir,
             json_file=self.val_ann,
             name="SUNRGBD",
@@ -337,9 +337,9 @@ class Exp(BaseExp):
         return val_loader
 
     def get_evaluator(self, batch_size, is_distributed, testdev=False, legacy=False):
-        from yolox.evaluators import SUNRGBEvaluator
+        from yolox.evaluators import SUNRGBDEvaluator
 
-        return SUNRGBEvaluator(
+        return SUNRGBDEvaluator(
             dataloader=self.get_eval_loader(batch_size, is_distributed,
                                             testdev=testdev, legacy=legacy),
             img_size=self.test_size,

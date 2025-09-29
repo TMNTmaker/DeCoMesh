@@ -3,7 +3,8 @@
 # Copyright (c) Megvii, Inc. and its affiliates.
 
 from .coco import COCODataset
-from .sunrgb import SUNRGBDataset
+from .sunrgbd_classes import SUNRGBD_CLASSES
+from .sunrgbd import SUNRGBDDataset
 from .coco_classes import COCO_CLASSES
 from .datasets_wrapper import CacheDataset, ConcatDataset, Dataset, MixConcatDataset
 from .mosaicdetection import MosaicDetection
