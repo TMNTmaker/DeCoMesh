@@ -7,11 +7,62 @@ import random
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
+from yolox.data import SUNRGBD_CLASSES_20, SUNRGBD_CLASSES_38
 from .base_exp import BaseExp
 
 __all__ = ["Exp", "check_exp_value"]
 
+
+
+from typing import Any, List
+import torch
+import numpy as np
+
+def _can_stack(ts: List[torch.Tensor]) -> bool:
+    return all(torch.is_tensor(t) and t.shape == ts[0].shape and t.dtype == ts[0].dtype for t in ts)
+
+def _to_tensor(x: Any):
+    if torch.is_tensor(x): return x
+    if isinstance(x, np.ndarray): return torch.from_numpy(x)
+    if isinstance(x, (int, float, np.integer, np.floating)): return torch.tensor(x)
+    return x
+
+def collate_auto(batch: List[Any]):
+    """
+    - テンソルは“形が完全一致”なら stack、そうでなければ list のまま
+    - dict/tuple/list は再帰的に処理
+    - 文字列などは list のまま
+    """
+    elem = batch[0]
+
+    # Tensor
+    if torch.is_tensor(elem):
+        return torch.stack(batch, 0) if _can_stack(batch) else batch
+
+    # numpy or number
+    if isinstance(elem, (np.ndarray, np.number, int, float)):
+        ts = [_to_tensor(x) for x in batch]
+        return torch.stack(ts, 0) if _can_stack(ts) else ts
+
+    # dict
+    if isinstance(elem, dict):
+        out = {}
+        keys = elem.keys()
+        for k in keys:
+            out[k] = collate_auto([b[k] for b in batch])
+        return out
+
+    # list / tuple
+    if isinstance(elem, (list, tuple)):
+        # すべて list/tuple かつ 長さが揃っているなら "列方向に" まとめる
+        if all(isinstance(b, (list, tuple)) for b in batch):
+            lens = [len(b) for b in batch]
+            if len(set(lens)) == 1:
+                transposed = list(zip(*batch))
+                return type(elem)(collate_auto(list(items)) for items in transposed)
+        # それ以外（= 可変長）はそのまま返す（例: categories）
+        return batch
+    return batch
 
 class Exp(BaseExp):
     def __init__(self):
@@ -92,7 +143,7 @@ class Exp(BaseExp):
         self.print_interval = 10
         # eval period in epoch, for example,
         # if set to 1, model will be evaluate after every epoch.
-        self.eval_interval = 10
+        self.eval_interval = 1
         # save history checkpoint or not.
         # If set to False, yolox will only save latest and best ckpt.
         self.save_history_ckpt = True
@@ -109,7 +160,7 @@ class Exp(BaseExp):
         self.nmsthre = 0.65
 
     def get_model(self):
-        from yolox.models import YOLOx3D,YOLOFPN, YOLOPAFPN, MeshNet, TriView2CoordGrid
+        from yolox.models import YOLOx3D, YOLOPAFPN, ClassNet,MeshNet, TriView2CoordGrid
         def init_yolo(M):
             for m in M.modules():
                 if isinstance(m, nn.BatchNorm2d):
@@ -118,10 +169,11 @@ class Exp(BaseExp):
 
         if getattr(self, "model", None) is None:
             #in_channels = [256, 512, 1024]
-            backbone = YOLOPAFPN(self.depth, self.width,in_channels = [256, 512, 1024])#[256, 512, 1024])#self.depth, self.width, in_channels=in_channels, act=self.act)
+            backbone = YOLOPAFPN(self.depth, self.width,in_channels = [256, 512, 1024], depthwise=True)
+            classnet = ClassNet(in_channels=256, hidden=256, num_classes=len(SUNRGBD_CLASSES_20), dropout_p=0.1)
             meshnet = MeshNet()
             coordinate3d = TriView2CoordGrid()
-            self.model = YOLOx3D(backbone,meshnet,coordinate3d)
+            self.model = YOLOx3D(backbone,classnet,meshnet,coordinate3d)
 
         self.model.apply(init_yolo)
         #self.model.head.initialize_biases(1e-2)
@@ -182,29 +234,31 @@ class Exp(BaseExp):
                     "cache_img must be None if you didn't create self.dataset before launch"
                 self.dataset = self.get_dataset(cache=False, cache_type=cache_img)
 
-        self.dataset = MosaicDetection(
-            dataset=self.dataset,
-            mosaic=False,#not no_aug,
-            img_size=self.input_size,
-            preproc=TrainTransform3D(
-                max_objects=20,
-                max_faces=6,
-                max_vertex=4,
-                flip_prob=self.flip_prob,
-                hsv_prob=self.hsv_prob),
-            degrees=self.degrees,
-            translate=self.translate,
-            mosaic_scale=self.mosaic_scale,
-            mixup_scale=self.mixup_scale,
-            shear=self.shear,
-            enable_mixup=self.enable_mixup,
-            mosaic_prob=self.mosaic_prob,
-            mixup_prob=self.mixup_prob,
-        )
+        #self.dataset = MosaicDetection(
+        #    dataset=self.dataset,
+        #    mosaic=False,#not no_aug,
+        #    img_size=self.input_size,
+        #    preproc=TrainTransform3D(
+        #        max_objects=20,
+        #        max_faces=6,
+        #        max_vertex=4,
+        #        flip_prob=self.flip_prob,
+        #        hsv_prob=self.hsv_prob),
+        #    degrees=self.degrees,
+        #    translate=self.translate,
+        #    mosaic_scale=self.mosaic_scale,
+        #    mixup_scale=self.mixup_scale,
+        #    shear=self.shear,
+        #    enable_mixup=self.enable_mixup,
+        #    mosaic_prob=self.mosaic_prob,
+        #    mixup_prob=self.mixup_prob,
+        #)
 
         if is_distributed:
             batch_size = batch_size // dist.get_world_size()
 
+        
+        
         sampler = InfiniteSampler(len(self.dataset), seed=self.seed if self.seed else 0)
 
         batch_sampler = YoloBatchSampler(
@@ -221,7 +275,7 @@ class Exp(BaseExp):
         # Check https://github.com/pytorch/pytorch/issues/63311 for more details.
         dataloader_kwargs["worker_init_fn"] = worker_init_reset_seed
 
-        train_loader = DataLoader(self.dataset, **dataloader_kwargs)
+        train_loader = DataLoader(self.dataset,collate_fn=collate_auto, **dataloader_kwargs)
 
         return train_loader
 
@@ -254,9 +308,9 @@ class Exp(BaseExp):
             inputs = nn.functional.interpolate(
                 inputs, size=tsize, mode="bilinear", align_corners=False
             )
-            targets[..., 0] = targets[..., 0] * scale_x
-            targets[..., 1] = targets[..., 1] * scale_x
-            targets[..., 2] = targets[..., 2] * scale_x
+            targets["mesh"][..., 0] = targets["mesh"][..., 0] * scale_x
+            targets["mesh"][..., 1] = targets["mesh"][..., 1] * scale_y
+            targets["mesh"][..., 2] = targets["mesh"][..., 2] * scale_x
         return inputs, targets
 
     def get_optimizer(self, batch_size):
@@ -332,7 +386,7 @@ class Exp(BaseExp):
             "sampler": sampler,
         }
         dataloader_kwargs["batch_size"] = batch_size
-        val_loader = torch.utils.data.DataLoader(valdataset, **dataloader_kwargs)
+        val_loader = torch.utils.data.DataLoader(valdataset,collate_fn=collate_auto, **dataloader_kwargs)
 
         return val_loader
 
@@ -353,8 +407,8 @@ class Exp(BaseExp):
         # NOTE: trainer shouldn't be an attribute of exp object
         return trainer
 
-    def eval(self, model, evaluator, is_distributed, half=False, return_outputs=False):
-        return evaluator.evaluate(model, is_distributed, half, return_outputs=return_outputs)
+    def eval(self, model, evaluator, half=False, return_outputs=False):
+        return evaluator.evaluate(model, half, return_outputs=return_outputs)
 
 
 def check_exp_value(exp: Exp):

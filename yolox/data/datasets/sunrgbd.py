@@ -4,7 +4,7 @@ import json
 import cv2
 import numpy as np
 from .datasets_wrapper import CacheDataset, cache_read_img
-from .sunrgbd_classes import SUNRGBD_CLASSES
+from .sunrgbd_classes import SUNRGBD_CLASSES_38, SUNRGBD_CLASSES_20
 
 class SUNRGBDDataset(CacheDataset):
     def __init__(
@@ -27,7 +27,7 @@ class SUNRGBDDataset(CacheDataset):
         self.name = name
         self.img_size = img_size
         self.annotations = self._load_sun_annotations()
-        self.class_ids = list(range(len(SUNRGBD_CLASSES)))
+        self.class_ids = list(range(len(SUNRGBD_CLASSES_20)))#list(range(len(SUNRGBD_CLASSES_38)))
         path_filename = [os.path.join(name, anno[3]) for anno in self.annotations]
         super().__init__(
             input_dimension=img_size,
@@ -263,10 +263,12 @@ class SUNRGBDDataset(CacheDataset):
                 o["clean_point"].append([poly[0],poly[1],poly[2]])
             objs.append(o)
             m3Dboxes.append(obj["3Dbox"])
-            if obj["name"] in SUNRGBD_CLASSES:
-                categories.append(SUNRGBD_CLASSES.index(obj["name"]))
+            if obj["name"] in SUNRGBD_CLASSES_20:#SUNRGBD_CLASSES_38:
+                #categories.append(SUNRGBD_CLASSES_38.index(obj["name"]))
+                categories.append(SUNRGBD_CLASSES_20.index(obj["name"]))
             else:
-                categories.append(SUNRGBD_CLASSES.index("others"))
+                #categories.append(SUNRGBD_CLASSES_38.index("others"))
+                categories.append(SUNRGBD_CLASSES_20.index("others"))
         
         r = min(self.img_size[0] / height, self.img_size[1] / width)
         faces = np.array([[0,1,2,3],
@@ -365,4 +367,10 @@ class SUNRGBDDataset(CacheDataset):
 
         if self.preproc is not None:
             img, target = self.preproc(img, target, self.input_dim)
-        return img, target, img_info, img_id,categories,resize_coef,cam_info,m3Dboxes
+        targets = {"mesh": target,
+                   "categories": categories,
+                   "resize_coef": resize_coef,
+                   "cam_info": cam_info,
+                   "m3Dboxes": m3Dboxes}
+        return img, targets, img_info, img_id,\
+            categories,resize_coef,cam_info,m3Dboxes

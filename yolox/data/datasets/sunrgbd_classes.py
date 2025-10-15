@@ -1,8 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 # Copyright (c) Megvii, Inc. and its affiliates.
+SUNRGBD_CLASSES_20  = (
+"bathtub",
+"bed",
+"bookshelf",
+"box",
+"chair",
+"counter",
+"desk",
+"door",
+"dresser",
+"garbage bin",
+"lamp",
+"monitor",
+"night stand",
+"pillow",
+"sink",
+"sofa",
+"table",
+"tv",
+"toilet",
+"others",
+)
 
-SUNRGBD_CLASSES = (
+
+SUNRGBD_CLASSES_38 = (
 "wall",
 "floor",
 "cabinet",
@@ -40,5 +63,6 @@ SUNRGBD_CLASSES = (
 "lamp",
 "bathtub",
 "bag",
-"others"
+"others",
+
 )

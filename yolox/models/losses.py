@@ -87,8 +87,8 @@ def chamfer_distance(
         return s, cnt
 
     for b in range(len(predict)):
-        pc_pred: torch.Tensor = predict[b][0].to(device).float()
-        pc_gt:   torch.Tensor = ground[b][0].to(device).float()
+        pc_pred: torch.Tensor = predict[0][b].to(device).float()
+        pc_gt:   torch.Tensor = ground[0][0].to(device).float()
 
         # 形状チェック
         if pc_pred.ndim != 2 or pc_pred.size(-1) != 3:
@@ -111,15 +111,18 @@ def chamfer_distance(
 
     loss = total_sum / (total_cnt.to(total_sum.dtype) + eps)
     return loss
+import torch
+from typing import List, Tuple, Sequence
+
 
 def IoU3D_voxel(
     predict: List[List[TensorLike]],
     ground:  List[List[TensorLike]],
-    grid_size: int = 32,
+    grid_size: int = 128,
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    3D IoU (voxel近似版)
+    3D IoU (voxel 近似版)
     Args:
         predict: list length=B, each = [vertices: (Ni,3), faces: (Mi,3), ...]
         ground : list length=B, each = [vertices: (Oi,3), faces: (Pi,3), ...]
@@ -127,67 +130,114 @@ def IoU3D_voxel(
     Returns:
         iou:  (B,) tensor
         loss: (B,) tensor = 1 - iou
+    注意:
+        - 予測とGTが同一座標系・同一スケールにあるのが前提。
+        - 両者の合成バウンディングボックスで[0,1]正規化して同じ体積に落としてからボクセル化する。
     """
-    def voxelize_mesh(vertices: torch.Tensor, faces: torch.Tensor, grid_size: int = 32) -> torch.Tensor:
+
+    # ---------- 単一メッシュ用のボクセル化（バッチ非対応） ----------
+    def voxelize_mesh_single(
+        vertices: torch.Tensor,  # (N,3) in [0,1]
+        faces: torch.Tensor,     # (M,3) long
+        grid_size: int,
+    ) -> torch.Tensor:
         """
-        Voxelize mesh (approximation: rasterize triangles into voxel grid).
-        Args:
-            vertices: (B, N, 3) vertex positions in [0,1] cube
-            faces:    (B, M, 3) triangle faces (indices into vertices)
-            grid_size: resolution of voxel grid
         Returns:
-            voxels: (B, grid_size, grid_size, grid_size) bool occupancy grid
+            voxels: (grid, grid, grid) bool occupancy
         """
-        B, N, _ = vertices.shape
-        voxels = torch.zeros((B, grid_size, grid_size, grid_size), dtype=torch.bool, device=vertices.device)
+        device = vertices.device
+        voxels = torch.zeros((grid_size, grid_size, grid_size),
+                             dtype=torch.bool, device=device)
 
-        # normalize vertices to grid coordinates
-        verts_grid = (vertices * (grid_size - 1)).long()
+        if vertices.numel() == 0 or faces.numel() == 0:
+            return voxels  # 空メッシュは空の占有
 
-        for b in range(B):
-            v = verts_grid[b]  # (N,3)
-            f = faces[b]       # (M,3)
-            for tri in f:
-                pts = v[tri]  # (3,3)
-                # bounding box of triangle
-                min_xyz = torch.clamp(pts.min(dim=0).values, 0, grid_size - 1)
-                max_xyz = torch.clamp(pts.max(dim=0).values, 0, grid_size - 1)
+        # [0,1] -> [0, grid_size-1] へ
+        verts_grid = (vertices.clamp(0.0, 1.0) * (grid_size - 1)).to(torch.long)  # (N,3)
 
-                # fill inside bounding box (coarse, not exact triangle fill)
-                xs = torch.arange(min_xyz[0], max_xyz[0]+1, device=vertices.device)
-                ys = torch.arange(min_xyz[1], max_xyz[1]+1, device=vertices.device)
-                zs = torch.arange(min_xyz[2], max_xyz[2]+1, device=vertices.device)
-                xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing="ij")
-                voxels[b, xx, yy, zz] = True
+        # 三角形ごとに粗いバウンディングボックスを True 埋め（近似）
+        # ※ 正確な三角形充填ではなく高速化・安定化目的の近似
+        for tri in faces:
+            pts = verts_grid[tri]  # (3,3)
+            min_xyz = pts.min(dim=0).values.clamp(0, grid_size - 1)
+            max_xyz = pts.max(dim=0).values.clamp(0, grid_size - 1)
+
+            # 範囲長が0以下の軸は arange が空になるので自然にスキップされる
+            xs = torch.arange(min_xyz[0].item(), max_xyz[0].item() + 1, device=device)
+            ys = torch.arange(min_xyz[1].item(), max_xyz[1].item() + 1, device=device)
+            zs = torch.arange(min_xyz[2].item(), max_xyz[2].item() + 1, device=device)
+
+            if xs.numel() == 0 or ys.numel() == 0 or zs.numel() == 0:
+                continue
+
+            xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing="ij")
+            voxels[xx, yy, zz] = True
 
         return voxels
+
+    # ---------- 入力チェック ----------
     assert len(predict) == len(ground), "バッチ長が一致していません"
     B = len(predict)
     if B == 0:
-        return torch.tensor([]), torch.tensor([])
+        # 返り値のデバイスは不定なのでCPU返し
+        return torch.empty(0), torch.empty(0)
 
-    device = predict[0][0].device
-    ious, losses = [], []
+    # デバイスは各要素の頂点デバイスを優先
+    device = predict[0][0].device if len(predict[0]) > 0 else torch.device("cpu")
+
+    ious: Sequence[torch.Tensor] = []
+    losses: Sequence[torch.Tensor] = []
 
     for b in range(B):
-        verts_pred = predict[b][0].to(device).float()
-        faces_pred = predict[b][1].to(device).long()
-        verts_gt   = ground[b][0].to(device).float()
-        faces_gt   = ground[b][1].to(device).long()
+        # それぞれ (N,3), (M,3)
+        verts_pred = predict[0][b].to(device).float()
+        faces_pred = predict[1][b].to(device).long()
+        verts_gt   = ground[0][b].to(device).float()
+        faces_gt   = ground[1][b].to(device).long()
 
-        vox_pred = voxelize_mesh(verts_pred, faces_pred, grid_size)
-        vox_gt   = voxelize_mesh(verts_gt, faces_gt, grid_size)
+        # --- 空メッシュの扱い（両方空なら IoU=1、片方空なら IoU=0） ---
+        is_empty_pred = (verts_pred.numel() == 0) or (faces_pred.numel() == 0)
+        is_empty_gt   = (verts_gt.numel() == 0) or (faces_gt.numel() == 0)
+        if is_empty_pred and is_empty_gt:
+            iou = torch.tensor(1.0, device=device)
+            loss = 1.0 - iou
+            ious.append(iou)
+            losses.append(loss)
+            continue
+        elif is_empty_pred or is_empty_gt:
+            iou = torch.tensor(0.0, device=device)
+            loss = 1.0 - iou
+            ious.append(iou)
+            losses.append(loss)
+            continue
 
-        inter = torch.logical_and(vox_pred, vox_gt).sum().float()
-        union = torch.logical_or(vox_pred, vox_gt).sum().float()
-        iou = inter / (union + eps)
+        # --- 予測/GT を同じバウンディングボックスに正規化 ---
+        #     合成BBoxで[0,1]に押し込める（同一体積に対してボクセル化）
+        all_verts = torch.cat([verts_pred, verts_gt], dim=0)  # (N+O,3)
+        mn = all_verts.min(dim=0).values
+        mx = all_verts.max(dim=0).values
+        span = (mx - mn).clamp_min(eps)  # 0除算回避
+
+        verts_pred_n = (verts_pred - mn) / span
+        verts_gt_n   = (verts_gt   - mn) / span
+
+        # --- ボクセル化 ---
+        vox_pred = voxelize_mesh_single(verts_pred_n, faces_pred, grid_size)
+        vox_gt   = voxelize_mesh_single(verts_gt_n,   faces_gt,   grid_size)
+
+        # --- IoU 計算 ---
+        inter = torch.logical_and(vox_pred, vox_gt).sum(dtype=torch.float32)
+        union = torch.logical_or(vox_pred,  vox_gt).sum(dtype=torch.float32)
+
+        # 両方空は前段で処理済みだが、念のため union==0 なら IoU=1 とする
+        iou = inter / (union + eps) if union > 0 else torch.tensor(1.0, device=device)
         loss = 1.0 - iou
 
         ious.append(iou)
         losses.append(loss)
 
-    return torch.stack(ious), torch.stack(losses)
-import torch
+    return torch.stack(list(ious)).mean(), torch.stack(list(losses)).mean()
+
 from typing import List, Tuple, Union
 from pytorch3d.structures import Meshes
 from pytorch3d.ops import sample_points_from_meshes
@@ -251,8 +301,8 @@ def IoU3D(
         pts_b    = all_pts.unsqueeze(0) # (1,2S,3)
 
         # inside 判定（bool）
-        inside_pred: torch.Tensor = check_sign(v_pred_b, f_pred_b, pts_b)[0]  # (2S,)
-        inside_gt:   torch.Tensor = check_sign(v_gt_b,   f_gt_b,   pts_b)[0]  # (2S,)
+        inside_pred: torch.Tensor = check_sign(v_pred_b, f_pred, pts_b)[0]  # (2S,)
+        inside_gt:   torch.Tensor = check_sign(v_gt_b,   f_gt,   pts_b)[0]  # (2S,)
 
         inter = torch.sum(inside_pred & inside_gt).float()
         union = torch.sum(inside_pred | inside_gt).float()

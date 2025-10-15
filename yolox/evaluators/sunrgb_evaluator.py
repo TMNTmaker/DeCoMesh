@@ -12,7 +12,6 @@ import numpy as np
 
 import torch
 
-
 from yolox.utils import (
     is_main_process,
     synchronize,
@@ -65,6 +64,7 @@ class SUNRGBDEvaluator:
         N = vertices_img.shape[0]
         homo = np.concatenate([vertices_img[:,:2], np.ones((N,1))], axis=1)  # (u,v,1)
         z = vertices_img[:,2:3]  # depth
+        z = z.cpu().numpy()
         K_inv = np.linalg.inv(K)
         cam = (K_inv @ homo.T) * z.T  # (3,N)
         cam_h = np.vstack([cam, np.ones((1,N))])
@@ -109,6 +109,7 @@ class SUNRGBDEvaluator:
             components.append(np.array(comp, dtype=np.int64))
         return components
 
+
     def mesh_to_3dbox_multi(self,vertices_world: np.ndarray, faces: np.ndarray) -> List[Box3D]:
         """
         vertices_world: (N,3) world座標に変換済み頂点群（複数オブジェクト混在可）
@@ -121,8 +122,8 @@ class SUNRGBDEvaluator:
             verts_sub = vertices_world[comp]
 
             # AABB
-            min_xyz = verts_sub.min(axis=0)
-            max_xyz = verts_sub.max(axis=0)
+            min_xyz = verts_sub.min(axis=0).values
+            max_xyz = verts_sub.max(axis=0).values
             center = (min_xyz + max_xyz) / 2
             size = (max_xyz - min_xyz)
 
@@ -193,7 +194,7 @@ class SUNRGBDEvaluator:
             data_list_elem, sunrgbdDt_elem, sunrgbdGt_elem = self.convert_to_sunrgb_format(
                 outputs, info_imgs, ids,
                 categories,resize_coefes,cam_infoes,m3Dboxes, 
-                return_outputs=True)
+                )
             data_list.extend(data_list_elem)
             sunrgbdDt.update(sunrgbdDt_elem)
             sunrgbdGt.update(sunrgbdGt_elem)
@@ -208,30 +209,63 @@ class SUNRGBDEvaluator:
 
     def convert_to_sunrgb_format(self, outputs, info_imgs, ids,
                                  categories,resize_coefes,cam_infoes,m3Dboxes):
+        from yolox.data import SUNRGBD_CLASSES_38, SUNRGBD_CLASSES_20
         data_list = []
         sunrgbdDt = defaultdict(Dict[str, List[Det]])
         sunrgbdGt = defaultdict(Dict[str, List[GT]])
-        for (output, info_img, img_id,gt_category,resize_coef,cam_info,gt_m3Dboxes) in zip(
-            outputs, info_imgs, ids,
-            categories,resize_coefes,cam_infoes,m3Dboxes
+        for (cls_prob,vertices,faces, _, img_id,
+             gt_category,resize_coef,cam_intrinsics,cam_extrinsics,gt_m3Dboxes) in zip(
+            outputs["cls_prob"],outputs["vertices"],outputs["faces"], info_imgs, ids,
+            categories,resize_coefes,cam_infoes["intrinsics"],cam_infoes["extrinsics"],m3Dboxes
         ):
-            if output is None:
+            if cls_prob is None or vertices is None or faces is None:
                 continue
-            output = output.cpu()
+            cls_prob = cls_prob.cpu() 
+            vertices = vertices.cpu() 
+            faces = faces.cpu() 
+            cam_intrinsics = cam_intrinsics.reshape([3,3])
             
-            virtex_world = self.image_to_world(self,output[:,0]/resize_coef, 
-                                cam_info["intrinsics"], 
-                                cam_info["extrinsics"])
-            pred_3dboxes = self.mesh_to_3dbox(virtex_world)
             
+            
+            virtex_world = self.image_to_world(vertices/resize_coef, 
+                                cam_intrinsics, 
+                                cam_extrinsics)
+            pred_3dboxes = self.mesh_to_3dbox_multi(virtex_world,faces)
+            #pred_3dboxexとoutput[:]["cls_plob"]を結びつける
+            #output[:]["cls_plob"]は　(B, num_classes, H, W)
+            #pred_3dboxesはlist of Box3D
+            
+            pred_labels = []
+            scores = []
+            for box in pred_3dboxes:
+                # ボックス中心を画像座標に投影（u, v, z）
+                center_world = np.array([[box.cx, box.cy, box.cz]])
+                # world→image座標変換
+                Rt = np.linalg.inv(cam_extrinsics)
+                K = cam_intrinsics
+                center_h = np.concatenate([center_world, np.ones((1,1))], axis=1).T  # (4,1)
+                cam = Rt @ center_h  # (4,1)
+                uvw = K @ cam[:3, :]  # (3,1)
+                u = int(uvw[0,0] / uvw[2,0] / resize_coef)
+                v = int(uvw[1,0] / uvw[2,0] / resize_coef)
 
-            # preprocessing: resize
-            labels = [37]*len(pred_3dboxes) # dummy 37=others
-            scores = [1.0]*len(pred_3dboxes)#dummy
+                # 範囲外ならスキップ
+                H, W = cls_prob.shape[-2:]
+                if not (0 <= u < W and 0 <= v < H):
+                    pred_labels.append(len(SUNRGBD_CLASSES_20)-1)  # dummy
+                    scores.append(0.0)
+                    continue
+
+                # クラス確率取得
+                cls_probs = cls_prob[ :, v, u]  # (num_classes,)
+                label = int(torch.argmax(cls_probs).item())
+                score = float(torch.max(cls_probs).item())
+                pred_labels.append(label)
+                scores.append(score)
 
 
-            for ind in range(pred_3dboxes.shape[0]):
-                label = self.dataloader.dataset.class_ids[int(labels[ind])]
+            for ind in range(len(pred_3dboxes)):
+                label = self.dataloader.dataset.class_ids[int(pred_labels[ind])]
                 pred_data = {
                     "image_id": int(img_id),
                     "category_id": label,
@@ -239,20 +273,37 @@ class SUNRGBDEvaluator:
                     "score": float(scores[ind]),
                 }  # for SUNRGBD json format
                 data_list.append(pred_data)
+                        
+            # 予測の詰め方（OK版）
+            sunrgbdDt[str(img_id)] = [
+                Det(
+                    label=int(self.dataloader.dataset.class_ids[int(pred_labels[ind])]),
+                    box=pred_3dboxes[ind],
+                    score=float(scores[ind]),
+                )
+                for ind in range(len(pred_3dboxes))
+            ]
 
-            sunrgbdDt.update({
-                str(img_id): {Det: [
-                    Det(label=int(self.dataloader.dataset.class_ids[int(labels[ind])]),
-                        box=pred_3dboxes[ind],
-                        score=float(scores[ind])) for ind in range(pred_3dboxes.shape[0])
-                ]}})
+            # GTの詰め方（OK版）
+            if len(gt_m3Dboxes) > len(gt_category):
+                # gt_categoryに無い分は others で穴埋め
+                gt_category = list(gt_category) + [len(SUNRGBD_CLASSES_20)-1] * (len(gt_m3Dboxes) - len(gt_category))
+
             
-            sunrgbdGt.update({
-                str(img_id): {GT: [
-                    GT(label=int(self.dataloader.dataset.class_ids[int(gt_category[ind])]),
-                       box=gt_m3Dboxes[ind]) for ind in range(gt_m3Dboxes.shape[0])
-                ]}})
             
+            sunrgbdGt[str(img_id)] = [
+                    GT(
+                        label=int(self.dataloader.dataset.class_ids[int(gt_category[ind])]),
+                        box=Box3D(
+                            gt_m3Dboxes[ind][0], gt_m3Dboxes[ind][1], gt_m3Dboxes[ind][2],
+                            gt_m3Dboxes[ind][3], gt_m3Dboxes[ind][4], gt_m3Dboxes[ind][5],
+                            gt_m3Dboxes[ind][6],
+                        ),
+                    )
+                    for ind in range(len(gt_m3Dboxes))
+                    if len(gt_m3Dboxes[ind]) == 7
+                ]
+
         return data_list, sunrgbdDt,sunrgbdGt
 
     def evaluate_prediction(self, sunrgbdGt, sunrgbdDt, statistics):

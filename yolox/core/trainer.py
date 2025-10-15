@@ -94,13 +94,39 @@ class Trainer:
             self.train_one_iter()
             self.after_iter()
 
+    # --- utils: 任意のツリー(dict/list/tuple)内の Tensor に処理を当てる ---
+    def tree_map_tensors(self,obj, fn):
+        import torch
+        if torch.is_tensor(obj):
+            return fn(obj)
+        if isinstance(obj, dict):
+            return {k: self.tree_map_tensors(v, fn) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            mapped = [self.tree_map_tensors(v, fn) for v in obj]
+            return type(obj)(mapped) if not isinstance(obj, list) else mapped
+        return obj  # 文字列/数値/None などはそのまま
+
+    def cast_dtype_no_grad(self,tree, dtype):
+        # 浮動小数だけ dtype 変換。intやlongのラベルはそのまま。
+        import torch
+        def _fn(t: torch.Tensor):
+            if t.is_floating_point():
+                t = t.to(dtype, non_blocking=True)
+            # targetは学習で微分しないはずなので明示的にFalse
+            if t.requires_grad:
+                t = t.detach()  # 既存グラフを切る
+            t.requires_grad_(False)
+            return t
+        return self.tree_map_tensors(tree, _fn)
+
+
+
     def train_one_iter(self):
         iter_start_time = time.time()
 
         inps, targets = self.prefetcher.next()
         inps = inps.to(self.data_type)
-        targets = targets.to(self.data_type)
-        targets.requires_grad = False
+        targets = self.cast_dtype_no_grad(targets, self.data_type)
         inps, targets = self.exp.preprocess(inps, targets, self.input_size)
         data_end_time = time.time()
 
@@ -217,7 +243,10 @@ class Trainer:
 
     def before_epoch(self):
         logger.info("---> start train epoch{}".format(self.epoch + 1))
-
+        
+        ##FOR DEBUG
+        #self.evaluate_and_save_model()
+        ##
         if self.epoch + 1 == self.max_epoch - self.exp.no_aug_epochs or self.no_aug:
             logger.info("--->No mosaic aug now!")
             self.train_loader.close_mosaic()
@@ -364,19 +393,19 @@ class Trainer:
 
         if self.rank == 0:
             if self.args.logger == "tensorboard":
-                self.tblogger.add_scalar("val/COCOAP50", ap50, self.epoch + 1)
-                self.tblogger.add_scalar("val/COCOAP50_95", ap50_95, self.epoch + 1)
+                self.tblogger.add_scalar("val/SUNRGBDAP50", ap50, self.epoch + 1)
+                self.tblogger.add_scalar("val/SUNRGBDAP50_95", ap50_95, self.epoch + 1)
             if self.args.logger == "wandb":
                 self.wandb_logger.log_metrics({
-                    "val/COCOAP50": ap50,
-                    "val/COCOAP50_95": ap50_95,
+                    "val/SUNRGBDAP50": ap50,
+                    "val/SUNRGBDAP50_95": ap50_95,
                     "train/epoch": self.epoch + 1,
                 })
                 self.wandb_logger.log_images(predictions)
             if self.args.logger == "mlflow":
                 logs = {
-                    "val/COCOAP50": ap50,
-                    "val/COCOAP50_95": ap50_95,
+                    "val/SUNRGBDAP50": ap50,
+                    "val/SUNRGBDAP50_95": ap50_95,
                     "val/best_ap": round(self.best_ap, 3),
                     "train/epoch": self.epoch + 1,
                 }

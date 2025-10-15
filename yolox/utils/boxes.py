@@ -87,7 +87,7 @@ def cluster_vectors3D_torch(
 ):
     """
     Args:
-        vector_field: (9, D, H, W)  [offset(z,y,x),..., target(z,y,x)]
+        vector_field: (6, D, H, W)  [offset(z,y,x), target(z,y,x)]
     Returns:
         vertices: (N, 3)  float (x,y,z) in coords
         faces:    (M, 3)  long  [vertices indicesx 3] triangular faces
@@ -103,10 +103,8 @@ def cluster_vectors3D_torch(
     tgt = vector_field[3:]# (3,D,H,W): z,y,x
 
     # 有効ボクセル
-    mag_tgt = torch.linalg.norm(tgt, dim=0)  # (D,H,W)
-    mask_tgt = mag_tgt > min_norm
-    mag_off = torch.linalg.norm(off, dim=0)  # (D,H,W)
-    mask_off = mag_off > min_norm
+    mask_tgt = torch.linalg.norm(tgt, dim=0) > min_norm # (D,H,W)
+    mask_off = torch.linalg.norm(off, dim=0) > min_norm  # (D,H,W)
     
     
     index_map_tgt = torch.full((D, H, W), -1, dtype=torch.long, device=device)
@@ -243,12 +241,13 @@ def cluster_vectors3D_torch(
                     if mask_off[nz, ny, nx]: #and abs(_angle_lt_deg(np0, normal[:,nz, ny, nx])<90.0):
                         found_end_m = True
                         break
+            # 終点が両方見つかって、長さが大きく異なる場合は打ち切り
             if abs(n_m-n_p)>1:
                 if n_m>n_p:
                     found_end_p=False
                 else:
                     found_end_m=False
-            
+            # 同じ辺の場所で重複させない
             for lms in length_map_step[z0, y0, x0]:
                 if abs(lms-(n_m+n_p))<2:
                     found_end_p=False
@@ -366,16 +365,6 @@ def cluster_vectors3D_torch(
             return torch.empty((0,), dtype=torch.long, device=device)
         nbs = dst_ud[src_ud == i]
         return torch.unique(nbs)
-    def tensor_intersect1d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Return unique sorted intersection of 1D long tensors a, b (device返し)."""
-        if a.numel() == 0 or b.numel() == 0:
-            return torch.empty(0, dtype=a.dtype, device=a.device)
-        # set で高速 & 簡潔（要素数が巨大でなければ十分速い）
-        s = set(a.tolist())
-        s.intersection_update(b.tolist())
-        if not s:
-            return torch.empty(0, dtype=a.dtype, device=a.device)
-        return torch.tensor(sorted(s), dtype=a.dtype, device=a.device)
 
     # === 三角面検出（3-cycle）
     faces_list = []
@@ -418,6 +407,404 @@ def cluster_vectors3D_torch(
 
     # 返却（必要なら new_edges も返せるが、仕様に合わせて省略可）
     return new_vertices, faces, index_map_tgt
+
+
+import math
+import torch
+
+#@torch.no_grad()
+def cluster_vectors3D_torch_fast(
+    vector_field: torch.Tensor,
+    mag: float,
+    min_norm: float = 1e-4,
+    merge_radius: float = 1.0,
+    max_sample: int = 1000,
+    max_steps: int | None = None,
+    step_eps: float = 1e-12,
+):
+    """
+    Ultra-fast version.
+    Args:
+        vector_field: (6, D, H, W) = [off(z,y,x), tgt(z,y,x)]
+        mag:          座標スケール
+        min_norm:     有効ボクセルしきい値
+        merge_radius: 近接マージ半径（座標系の単位）
+        max_sample:   探索する seed（= tgt>thr）の上限
+        max_steps:    1 チェーンの両方向合計ステップ上限（未指定で √(D^2+H^2+W^2) を丸め）
+        step_eps:     正規化のゼロ割防止
+        face_detect_max_edges: エッジが多すぎる時の三角面検出の安全上限
+
+    Returns:
+        vertices: (Nv, 3) float
+        faces:    (Mf, 3) long
+        index_map:(D, H, W) long  連鎖ID（未割当=-1）
+    """
+    from collections import defaultdict
+    assert vector_field.dim() == 4 and vector_field.size(0) == 6, "vector_field must be (6,D,H,W)"
+    device = vector_field.device
+    dtypef = vector_field.dtype
+    _, D, H, W = vector_field.shape
+
+    off = vector_field[:3]       # (3,D,H,W) z,y,x
+    tgt = vector_field[3:]       # (3,D,H,W) z,y,x
+
+    # 有効マスク
+    mask_tgt = torch.linalg.norm(tgt, dim=0) > min_norm  # (D,H,W)
+    mask_off = torch.linalg.norm(off, dim=0) > min_norm  # (D,H,W)
+
+    # index_map: 連鎖ID を格納（未割当=-1）
+    index_map = torch.full((D, H, W), -1, dtype=torch.long, device=device)
+    # seeds: tgt>thr の先頭 max_sample を使用（強度 topK にしたい場合はここで上書き可能）
+    seeds = mask_tgt.nonzero(as_tuple=False)  # (Nt, 3)[z,y,x]
+    if seeds.numel() == 0:
+        empty_v = torch.empty((0,3), dtype=dtypef, device=device)
+        empty_f = torch.empty((0,3), dtype=torch.long, device=device)
+        return empty_v, empty_f, index_map
+
+    K = min(seeds.size(0), max_sample)
+    seeds = seeds[:K]  # (K,3)
+
+    # 連鎖ID = 0..K-1（各 seed が一つのチェーンを代表）
+    chain_id = torch.arange(K, device=device, dtype=torch.long)
+
+
+    # 歩行ステップ上限
+    if max_steps is None:
+        ms = int(math.ceil(math.sqrt(D*D + H*H + W*W)))
+    else:
+        ms = int(max_steps)
+    # 両方向なので片側あたり T = ceil(ms/2)
+    T = max(1, (ms + 1)//2)
+
+    # 26 近傍を事前計算（long）
+    neigh = torch.tensor([[dz,dy,dx]
+                          for dz in (-1,0,1)
+                          for dy in (-1,0,1)
+                          for dx in (-1,0,1)
+                          if not(dz==0 and dy==0 and dx==0)],
+                         device=device, dtype=torch.long)  # (26,3)
+    # seeds の tgt ベクトル（方向）
+    z0, y0, x0 = seeds[:,0], seeds[:,1], seeds[:,2]  # (K,)
+    m0 = tgt[:, z0, y0, x0].transpose(0,1)           # (K,3) in (z,y,x)
+    #step_unit = m0
+    step_speed = (T*m0)
+    # m0 / (torch.linalg.norm(m0, dim=1, keepdim=True) + step_eps)  # (K,3) float
+    #単位ベクトル化
+    norms = torch.linalg.norm(step_speed, dim=1, keepdim=True) + step_eps
+    step_unit = step_speed / norms
+    # 現在離散座標（+/-）
+    cz_p = z0.clone()
+    cy_p = y0.clone()
+    cx_p = x0.clone()
+    cz_m = z0.clone()
+    cy_m = y0.clone()
+    cx_m = x0.clone()
+
+    # 連続座標（+/-）: float
+    here_p = torch.stack([z0, y0, x0], dim=1).to(dtypef)        # (K,3)
+    here_m = here_p -step_unit#- step_vec                                  # (K,3)
+
+    # このチェーンに割り当て（seed 自身）
+    index_map[cz_p, cy_p, cx_p] = chain_id
+
+    # 打ち切り・停止フラグ
+    stop_p = torch.zeros(K, dtype=torch.bool, device=device)
+    stop_m = torch.zeros(K, dtype=torch.bool, device=device)
+    # 打ち切り距離
+    stop_d_p = torch.zeros(K, dtype=torch.int32, device=device)
+    stop_d_m = torch.zeros(K, dtype=torch.int32, device=device)
+    stop_d_all = torch.zeros(K, dtype=torch.int32, device=device)
+    
+    # for 向けに mask_off をクイック参照する関数
+    def check_off(nz, ny, nx):
+        inb = (0 <= nz) & (nz < D) & (0 <= ny) & (ny < H) & (0 <= nx) & (nx < W)
+        out = torch.zeros_like(inb, dtype=torch.bool)
+        if inb.any():
+            out[inb] = mask_off[nz[inb], ny[inb], nx[inb]]
+        return out
+
+    # ====== 両方向バッチ歩行（T ステップ固定でテンソル更新）======
+    
+    for it in range(T):
+        # 既に止まってるものはスキップ（位置更新もしない）
+        active_p = ~stop_p
+        active_m = ~stop_m
+        any_active = active_p.any() | active_m.any()
+        if not any_active:
+            break
+        if it < 7:
+            scaled_mag = norms / (2**(it+1))   
+        step_vec =  step_unit *torch.maximum(scaled_mag, torch.ones_like(scaled_mag))  # (K,3) float
+        # 進む
+        here_p = torch.where(active_p.unsqueeze(1), here_p + step_vec, here_p)
+        here_m = torch.where(active_m.unsqueeze(1), here_m - step_vec, here_m)
+        blk=0
+        # 26 近傍候補の座標（+）
+        if active_p.any():
+            base_p = here_p.to(dtype=torch.long)  # (K,3)
+            inb_p = (0 <= base_p[:,0]) & (base_p[:,0] < D) &\
+                    (0 <= base_p[:,1]) & (base_p[:,1] < H) &\
+                    (0 <= base_p[:,2]) & (base_p[:,2] < W)
+            cand_p = inb_p & active_p
+            # 更新
+            idx = cand_p.nonzero(as_tuple=False).squeeze(1)
+            if idx.numel() > 0:
+                stop_d_p[idx] += 1
+                cz_p[idx], cy_p[idx], cx_p[idx] = base_p[idx,0], base_p[idx,1], base_p[idx,2]
+                #print("cz_p", cz_p.dtype, "min/max=", cz_p.min().item(), cz_p.max().item())
+                #print("cy_p", cy_p.dtype, "min/max=", cy_p.min().item(), cy_p.max().item())
+                #print("cx_p", cx_p.dtype, "min/max=", cx_p.min().item(), cx_p.max().item())
+                #print("chain_id", chain_id.dtype, chain_id.shape)
+                #print("index_map shape=", tuple(index_map.shape))
+                index_map[cz_p[idx], cy_p[idx], cx_p[idx]] = chain_id[idx]
+                # 終端判定: 進行先の近傍に off があれば停止
+                # ここでは「現在セル自身の近傍」に off があれば止める簡略版
+                # 26近傍で off があるかを確認
+                around = (torch.stack([cz_p[idx], cy_p[idx], cx_p[idx]], dim=1)[:,None,:] + neigh[None,:,:])
+                az, ay, ax = around[:,:,0], around[:,:,1], around[:,:,2]
+                off_nb = check_off(az, ay, ax)             # (n_act,26) True=off
+                has_off = off_nb.any(dim=1) 
+                stop_p[idx] |= has_off 
+                #end_m==True のものだけ、最寄りの off 近傍セルへ “終点” を更新
+                if has_off.any():
+                    idx_end = idx[has_off]                 # 元の K 次元のインデックス
+                    cand_z = az[has_off]                   # (n_end,26)
+                    cand_y = ay[has_off]
+                    cand_x = ax[has_off]
+
+                    # here_m の現在位置に最も近い off 近傍セルを選ぶ
+                    # 距離を float で計算（非 off は inf に）
+                    cand_pos = torch.stack(
+                        [cand_z.to(dtypef), cand_y.to(dtypef), cand_x.to(dtypef)], dim=2
+                    )                                      # (n_end,26,3)
+                    here_sel = here_p[idx_end]             # (n_end,3)
+                    d2 = torch.linalg.norm(here_sel[:,None,:] - cand_pos, dim=2)  # (n_end,26)
+                    d2[~off_nb[has_off]] = float("inf")    # off 以外を無効化
+                    kmin = d2.argmin(dim=1)                # (n_end,)
+
+                    bz2 = cand_z[torch.arange(kmin.numel(), device=device), kmin]
+                    by2 = cand_y[torch.arange(kmin.numel(), device=device), kmin]
+                    bx2 = cand_x[torch.arange(kmin.numel(), device=device), kmin]
+
+                    # 終端セルとして採用
+                    cz_p[idx_end], cy_p[idx_end], cx_p[idx_end] = bz2, by2, bx2
+                    index_map[bz2, by2, bx2] = chain_id[idx_end]
+        # 26 近傍候補の座標（-）
+        if active_m.any():
+            base_m = here_m.to(dtype=torch.long)  # (K,3)
+            inb_m = (0 <= base_m[:,0]) & (base_m[:,0] < D) & \
+                    (0 <= base_m[:,1]) & (base_m[:,1] < H) & \
+                    (0 <= base_m[:,2]) & (base_m[:,2] < W)
+            cand_m = inb_m & active_m
+            idx = cand_m.nonzero(as_tuple=False).squeeze(1)
+            if idx.numel() > 0:
+                stop_d_m[idx] += 1
+                cz_m[idx], cy_m[idx], cx_m[idx] = base_m[idx,0], base_m[idx,1], base_m[idx,2]
+                index_map[cz_m[idx], cy_m[idx], cx_m[idx]] = chain_id[idx]
+                around = (torch.stack([cz_m[idx], cy_m[idx], cx_m[idx]], dim=1)[:,None,:] + neigh[None,:,:])
+                az, ay, ax = around[:,:,0], around[:,:,1], around[:,:,2]
+                off_nb = check_off(az, ay, ax)             # (n_act,26) True=off
+                has_off = off_nb.any(dim=1) 
+                stop_m[idx] |= has_off 
+                # end_m==True のものだけ、最寄りの off 近傍セルへ “終点” を更新
+                if has_off.any():
+                    idx_end = idx[has_off]                 # 元の K 次元のインデックス
+                    cand_z = az[has_off]                   # (n_end,26)
+                    cand_y = ay[has_off]
+                    cand_x = ax[has_off]
+
+                    # here_m の現在位置に最も近い off 近傍セルを選ぶ
+                    # 距離を float で計算（非 off は inf に）
+                    cand_pos = torch.stack(
+                        [cand_z.to(dtypef), cand_y.to(dtypef), cand_x.to(dtypef)], dim=2
+                    )                                      # (n_end,26,3)
+                    here_sel = here_m[idx_end]             # (n_end,3)
+                    d2 = torch.linalg.norm(here_sel[:,None,:] - cand_pos, dim=2)  # (n_end,26)
+                    d2[~off_nb[has_off]] = float("inf")    # off 以外を無効化
+                    kmin = d2.argmin(dim=1)                # (n_end,)
+
+                    bz2 = cand_z[torch.arange(kmin.numel(), device=device), kmin]
+                    by2 = cand_y[torch.arange(kmin.numel(), device=device), kmin]
+                    bx2 = cand_x[torch.arange(kmin.numel(), device=device), kmin]
+
+                    # 終端セルとして採用
+                    cz_m[idx_end], cy_m[idx_end], cx_m[idx_end] = bz2, by2, bx2
+                    index_map[bz2, by2, bx2] = chain_id[idx_end]
+        # 片側だけ極端に進んだらバランスを取る
+        #step_diff = stop_d_p - stop_d_m
+        #stop_p = stop_p | (step_diff > 1)   # +方向が進みすぎたら一時停止
+        #stop_m = stop_m | (step_diff < -1) 
+        stop_p = torch.where((stop_d_m-stop_d_p)>1, False, stop_p)
+        stop_m = torch.where((stop_d_p-stop_d_m)>1, False, stop_m)
+        #stop_p = torch.where((stop_d_all!=0) & torch.abs(stop_d_all-(stop_d_m + stop_d_p))<2, False, stop_p)
+        #stop_m = torch.where((stop_d_all!=0) & torch.abs(stop_d_all-(stop_d_m + stop_d_p))<2, False, stop_m)
+        #stop_d_all = torch.where(stop_p & stop_m & (torch.abs(stop_d_m - stop_d_p) < 2),stop_d_p + stop_d_m,stop_d_all)
+
+            
+    # ====== 始点・終点の 3D 座標を一括生成 ======
+    # 始点（+側の停止セル）
+    o0 = off[:, cz_p, cy_p, cx_p].transpose(0,1) + 0.5  # (K,3) (oz,oy,ox)
+    p0_grid = torch.stack([cz_p.to(dtypef), cy_p.to(dtypef), cx_p.to(dtypef)], dim=1)
+    p0_off  = torch.stack([o0[:,2], o0[:,1], o0[:,0]], dim=1)  # to (x,y,z) 順
+    p0 = (p0_grid + p0_off) * mag                  # (K,3) -> (x,y,z)
+
+    # 終点（-側の停止セル）
+    o1 = off[:, cz_m, cy_m, cx_m].transpose(0,1) + 0.5
+    p1_grid = torch.stack([cx_m.to(dtypef), cy_m.to(dtypef), cz_m.to(dtypef)], dim=1)
+    p1_off  = torch.stack([o1[:,2], o1[:,1], o1[:,0]], dim=1)
+    p1 = (p1_grid + p1_off) * mag                               # (K,3) (x,y,z)
+
+    
+    # 無効（同一点）を除外
+    valid_edge = (torch.linalg.norm(p1 - p0, dim=1) > 1e-6)
+    p0 = p0[valid_edge]
+    p1 = p1[valid_edge]
+    E  = p0.size(0)
+    if E == 0:
+        empty_v = torch.empty((0,3), dtype=dtypef, device=device)
+        empty_f = torch.empty((0,3), dtype=torch.long, device=device)
+        # index_map は返す
+        return empty_v, empty_f, index_map
+
+    # 頂点配列（旧）: 2E 個（[p0,p1] を縦に並べる）
+    vertices = torch.cat([p0, p1], dim=0)  # (2E,3)
+    edges    = torch.stack([torch.arange(E, device=device, dtype=torch.long),
+                                torch.arange(E, device=device, dtype=torch.long)+E], dim=1)  # (E,2)
+    group2verts = defaultdict(set)
+    for i in range(E):
+        group2verts[i].add(i)      # p0
+        group2verts[i].add(i+E)    # p1
+        
+    # === 双方向化
+    def make_bidir_pairs(pairs: torch.Tensor, dedup: bool = True) -> torch.Tensor:
+        """
+        pairs: (M, 2) の long/ints テンソル。例 [[1,2],[3,5],...]
+        戻り値: (M' ,2) 双方向化したペア。例 [[1,2],[2,1],[3,5],[5,3],...]
+        """
+        assert pairs.dim() == 2 and pairs.size(1) == 2
+        rev = pairs[:, [1, 0]]
+        both = torch.cat([pairs, rev], dim=0)
+        if dedup:
+            # 行を辞書式で一意化（GPU可）
+            both = torch.unique(both, dim=0)
+        return both
+    
+    edges_each = make_bidir_pairs(edges)
+    # ====== 近接マージ ======
+    keep = torch.ones(vertices.size(0), dtype=torch.bool, device=device)
+    keep_map = {} # 代表 -> 吸収された旧頂点一覧
+    edge_map = {} # 代表 -> 吸収された旧頂点の関連エッジ一覧
+    if vertices.size(0) > 1 and merge_radius > 0:
+        for i in range(vertices.size(0)):
+            if not keep[i]:
+                continue
+            if i + 1 >= vertices.size(0):
+                break
+            di = (vertices[i+1:] == vertices[i]).all(dim=1)
+            dup = (di  == True).nonzero(as_tuple=False).squeeze(-1)
+            if dup.numel() > 0:
+                dup_idxs = dup + (i + 1)
+                keep[dup_idxs] = False
+                dup_idxs = torch.cat([dup_idxs, torch.tensor([i], device=device)])
+                keep_map[i]=dup_idxs        
+                #関連する辺を抽出
+                edge_map[i] = edges_each[dup_idxs,1]
+
+        if len(edge_map) == 0:
+            new_edges = torch.empty((0, 2), dtype=torch.long, device='cuda:0')
+        else:
+            # 1) 値（右列）を縦に連結
+            all_vals = torch.cat(list(edge_map.values())).to(dtype=torch.long)
+            # 2) 各キーを、そのキーが持つ要素数ぶんだけ繰り返す
+            keys = torch.tensor(list(edge_map.keys()), device=device, dtype=torch.long)
+            counts = torch.tensor([v.numel() for v in edge_map.values()], device=device, dtype=torch.long)
+            all_keys = torch.repeat_interleave(keys, counts)
+            # 3) 2列にまとめる
+            new_edges = torch.stack([all_keys, all_vals], dim=1)
+    # === 隣接リスト（neighbors_of_i = unique(dst[src==i])）
+    if new_edges.numel() > 0:
+        src = new_edges[:,0]
+        dst = new_edges[:,1]
+        # 双方向化（無向グラフ扱い）
+        src_ud = torch.cat([src, dst], dim=0)
+        dst_ud = torch.cat([dst, src], dim=0)
+    else:
+        src_ud = torch.empty((0,), dtype=torch.long, device=device)
+        dst_ud = torch.empty((0,), dtype=torch.long, device=device)
+
+    def neighbors_of(i: int) -> torch.Tensor:
+        if src_ud.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=device)
+        nbs = dst_ud[src_ud == i]
+        return torch.unique(nbs)
+
+    # === 三角面検出（3-cycle）
+    faces_list = []
+    Nv = vertices.size(0)
+
+    # チェーングループ単位で三角形候補を探索（偽陽性削減）
+    for i in edge_map.keys():
+        group = edge_map[i]
+        if group.numel() < 3:
+            continue
+        # グループ内のみで探索
+        in_group = torch.zeros(Nv, dtype=torch.bool, device=device)
+        in_group[group] = True
+
+        # i < j < k の順で重複回避
+        Ni = neighbors_of(i)
+        Ni = Ni[in_group[Ni]]
+        if Ni.numel() < 2:
+            continue
+        
+        # j を走査
+        for _j,j in enumerate(Ni.tolist()):
+            for _k,k in enumerate(Ni.tolist()[_j+1:]):
+                if group.numel() < 4:
+                    faces_list.append([i, j, k])                    
+                else:
+                    Nj = neighbors_of(j)
+                    # 共通近傍 k（かつ k > j）を面とする
+                    if k in Nj:
+                        faces_list.append([i, j, k])
+                        
+    
+    if len(faces_list) > 0:
+        faces = torch.tensor(faces_list, dtype=torch.long, device=device)
+        # 同一三角形の重複除去（頂点をソートして一意化）
+        faces_sorted = torch.sort(faces, dim=1).values
+        faces = torch.unique(faces_sorted, dim=0)
+    else:
+        faces = torch.empty((0,3), dtype=torch.long, device=device)
+    
+    return vertices, faces, index_map
+
+def postprocess3D(
+    prediction: torch.Tensor,  # (B, D, H, W, 6)
+    mag: float,
+    threshold_deg: float = 10.0,
+    min_norm: float = 1e-4,
+    merge_radius: float = 5.0,
+):    
+    """
+    バッチ版ポストプロセス。各サンプルに対して (vertices, edges, index_map) を返す。
+    """  
+    
+    assert prediction.dim() == 5 and prediction.size(1) == 6#9
+    outs_v = []
+    outs_e = []
+    outs_im = []
+    for b in range(prediction.size(0)):
+        v, e, im = cluster_vectors3D_torch_fast(
+            prediction[b],
+            mag=mag,
+            min_norm=min_norm,
+            merge_radius=merge_radius,
+        )
+        outs_v.append(v)
+        outs_e.append(e)
+        outs_im.append(im)
+    return [outs_v, outs_e, outs_im]
 
 
 def cluster_vectors2D_torch(
@@ -578,422 +965,7 @@ def cluster_vectors2D_torch(
     faces=[]
     return vertices, faces, index_map
 
-import math
-import torch.nn.functional as F
-def cluster_vectors2D_torch_fast(
-    vector_field: torch.Tensor,   # (4,H,W) [off(y,x), tgt(y,x)]
-    mag: float,
-    threshold_deg: float = 10.0,
-    min_norm: float = 0.1,
-    merge_radius: float = 0.0,
-):
-    assert vector_field.dim() == 3 and vector_field.size(0) == 4, "vector_field must be (4,H,W)"
-    device = vector_field.device
-    dtype  = vector_field.dtype
-    _, H, W = vector_field.shape
 
-    off = vector_field[:2]              # (2,H,W) oy, ox
-    tgt = vector_field[2:]              # (2,H,W) ty, tx
-
-    # 有効画素マスク & 正規化
-    mag_tgt = torch.linalg.norm(tgt, dim=0,dtype=torch.float16)                  # (H,W)
-    mask    = mag_tgt > min_norm
-    v = torch.zeros_like(tgt)
-    v[:, mask] = tgt[:, mask] / mag_tgt[mask]                # 正規化済み target
-
-    # 8近傍方向（dy,dx）
-    dirs = [(-1,-1), (-1,0), (-1,1),
-            ( 0,-1),         ( 0,1),
-            ( 1,-1), ( 1,0), ( 1,1)]
-    # 中心を padding してから切り出すと速い
-    v_pad   = F.pad(v, (1,1,1,1))                            # (2,H+2,W+2)
-    mask_pad= F.pad(mask, (1,1,1,1), value=False)            # (H+2,W+2)
-
-    # 8方向の近傍正規化ベクトルを積んだテンソルを作る: (8,2,H,W)
-    nb = []
-    nbm= []
-    for dy, dx in dirs:
-        y0, y1 = 1+dy, 1+dy+H
-        x0, x1 = 1+dx, 1+dx+W
-        nb.append(v_pad[:, y0:y1, x0:x1])
-        nbm.append(mask_pad[y0:y1, x0:x1])
-    nb  = torch.stack(nb,  dim=0)                            # (8,2,H,W)
-    nbm = torch.stack(nbm, dim=0)                            # (8,H,W)
-
-    # コサイン類似度：中心 v と 8近傍 nb の内積（すでに正規化済み）
-    # sim[k,y,x] = dot(v[:,y,x], nb[k,:,y,x])
-    sim = (v.unsqueeze(0) * nb).sum(dim=1)                   # (8,H,W)
-
-    # 無効画素/無効近傍は -inf にして選ばれないように
-    sim = sim.masked_fill(~mask.unsqueeze(0), float('-inf'))     # 中心が無効なら全部 -inf
-    sim = sim.masked_fill(~nbm,               float('-inf'))     # 近傍が無効なら -inf
-
-    # 閾値
-    cos_thr = math.cos(math.radians(threshold_deg))
-    sim_thr = torch.tensor(cos_thr, device=device, dtype=sim.dtype)
-
-    # 各画素に対して最良近傍方向（argmax）。しきい値未満なら「次なし」
-    best_dir = sim.argmax(dim=0)                               # (H,W) in [0..7]
-    best_val = sim.gather(0, best_dir.unsqueeze(0)).squeeze(0) # (H,W)
-    has_next = best_val >= sim_thr
-
-    # フラット化した id と “次id”（なければ self か -1）を作る
-    yy, xx   = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij")
-    id_flat  = (yy*W + xx).flatten()                           # (HW,)
-    # 8方向のシフト先座標を事前に持つ
-    dyy = torch.tensor([d[0] for d in dirs], device=device)
-    dxx = torch.tensor([d[1] for d in dirs], device=device)
-    ny = (yy + dyy[best_dir])
-    nx = (xx + dxx[best_dir])
-    in_bounds = (ny>=0)&(ny<H)&(nx>=0)&(nx<W)
-    has_next  = has_next & in_bounds & mask                   # 自身が有効
-
-    next_id = torch.full((H,W), -1, dtype=torch.long, device=device)
-    next_id[has_next] = (ny[has_next] * W + nx[has_next]).to(torch.long)
-    next_id = next_id.flatten()                                # (HW,)
-
-    # 入次数を数える（始点=入次数0のノード）
-    valid_next = next_id >= 0
-    indeg = torch.zeros(H*W, device=device, dtype=torch.int32)
-    if valid_next.any():
-        indeg.scatter_add_(0, next_id[valid_next], torch.ones_like(next_id[valid_next], dtype=indeg.dtype))
-    starts_mask = (mask.flatten()) & valid_next & (indeg == 0)
-
-    if not starts_mask.any():
-        # 何も鎖が作れない
-        return (torch.empty((0,2), device=device, dtype=dtype),
-                torch.empty((0,2), device=device, dtype=torch.long))
-
-    start_ids = id_flat[starts_mask]                            # (Ns,)
-
-    # ポインタジャンピングで終点へ（log N 回くらい）
-    # -1 は自己に置換しておくと収束計算が簡単
-    to = next_id.clone()
-    self_id = torch.arange(H*W, device=device, dtype=torch.long)
-    to = torch.where(to < 0, self_id, to)
-    # 32回も回せば十分（~2^32 > 4e9）
-    for _ in range(32):
-        to = to[to]
-
-    end_ids = to[start_ids]                                     # (Ns,)
-
-    # 画素座標→ワールド座標
-    # 始点 p0 = (grid + off) * mag, 終点 p1 = (grid + off + tgt) * mag
-    def id_to_xy(ids: torch.Tensor):
-        y = (ids // W)
-        x = (ids %  W)
-        return x, y
-
-    sx, sy = id_to_xy(start_ids)
-    ex, ey = id_to_xy(end_ids)
-
-    # 取り出し（gather で一括）
-    # off, tgt は (2,H,W)。順序は (ox, oy) に並べ替える
-    # p = ( [x,y] + [ox,oy] [+ [tx,ty]] ) * mag
-    ox = off[1]; oy = off[0]
-    tx = tgt[1]; ty = tgt[0]
-
-    p0x = (sx.to(dtype) + ox[sy, sx]) * mag
-    p0y = (sy.to(dtype) + oy[sy, sx]) * mag
-    p1x = (ex.to(dtype) + ox[ey, ex] + tx[ey, ex]) * mag
-    p1y = (ey.to(dtype) + oy[ey, ex] + ty[ey, ex]) * mag
-
-    # 頂点: [p0s, p1s] を交互に並べると、エッジ作成が O(1)
-    Ns = start_ids.numel()
-    vertices = torch.empty((Ns*2, 2), device=device, dtype=dtype)
-    vertices[0::2, 0] = p0x; vertices[0::2, 1] = p0y
-    vertices[1::2, 0] = p1x; vertices[1::2, 1] = p1y
-
-    edges = torch.stack([
-        torch.arange(0, Ns*2, 2, device=device, dtype=torch.long),
-        torch.arange(1, Ns*2, 2, device=device, dtype=torch.long)
-    ], dim=1)
-
-    # 近接頂点マージ（量子化ハッシュで O(N)）
-    if merge_radius and merge_radius > 0 and vertices.numel() > 0:
-        # 量子化サイズ q ≈ merge_radius
-        q = torch.tensor(merge_radius, device=device, dtype=dtype)
-        keys = torch.round(vertices / q).to(torch.int64)              # (M,2)
-        # ハッシュ（2D → 1D）
-        # 衝突低減のために大きめ係数をかける
-        key_hash = keys[:, 0] * 73856093 + keys[:, 1] * 19349663
-        # Unique & inverse map
-        uniq, inv = torch.unique(key_hash, return_inverse=True)
-        # 代表点：同一バケツ内の平均にしても良いが、ここは最初の頂点を代表に
-        # 新しい頂点はバケツ順で 0..K-1
-        new_vertices = torch.zeros((uniq.size(0), 2), device=device, dtype=dtype)
-        # 代表を「最初の頂点」にしたいなら scatter_reduce の 'amax' で idx 集約なども可。
-        # ここでは単純に平均にしておく（見た目が安定）
-        # 平均 = sum / count
-        counts = torch.bincount(inv, minlength=uniq.size(0)).to(vertices.dtype).unsqueeze(1)
-        sums = torch.zeros_like(new_vertices)
-        sums.index_add_(0, inv, vertices)
-        new_vertices = sums / counts.clamp_min(1)
-
-        # エッジ端点のインデックスも置換して、自己ループと重複を除去
-        new_edges = torch.stack([inv[edges[:,0]], inv[edges[:,1]]], dim=1)
-        # 自己ループ除去
-        new_edges = new_edges[new_edges[:,0] != new_edges[:,1]]
-        if new_edges.numel() > 0:
-            new_edges = torch.unique(new_edges, dim=0)
-
-        vertices = new_vertices
-        edges    = new_edges
-
-    return vertices, edges
-
-
-from math import cos, radians
-def cluster_vectors3D_torch_fast(
-    vector_field: torch.Tensor,
-    mag: float,
-    threshold_deg: float = 10.0,
-    min_norm: float = 0.1,
-    merge_radius: float = 0.0,
-    max_steps: int | None = None,
-):
-    """
-    高速クラスタリング（3D, 全面ベクトル化）。
-    vector_field: (6, D, H, W) = [offset(z,y,x), target(z,y,x)]
-    戻り値: vertices (N,3: x,y,z), edges (M,2: long)
-    """
-    
-    assert vector_field.dim() == 4 and vector_field.size(0) == 6, "vector_field must be (6,D,H,W)"
-    dev = vector_field.device
-    dtype_in = vector_field.dtype
-    _, D, H, W = vector_field.shape
-
-    # 計算安定性のため内部は float32（半精度入力でも混在を避ける）
-    vf = vector_field.to(torch.float32)
-    off = vf[:3]  # (3,D,H,W) z,y,x
-    tgt = vf[3:]  # (3,D,H,W) z,y,x
-
-    # 有効ボクセル（targetノルム）
-    tgt_norm = torch.linalg.norm(tgt, dim=0)  # (D,H,W)
-    src_valid = tgt_norm > float(min_norm)
-
-    # unit ベクトル
-    eps = 1e-8
-    unit = tgt / (tgt_norm.clamp_min(eps))  # (3,D,H,W)
-
-    # 26近傍をまとめて評価: パディングしてスライス
-    # pad: (W,H,D) の順で [left,right, top,bottom, front,back] = 1 ずつ
-    pad_unit = F.pad(unit, (1, 1, 1, 1, 1, 1))  # (3, D+2, H+2, W+2)
-    pad_valid = F.pad(src_valid[None].float(), (1,1,1,1,1,1)).to(unit.dtype)  # (1,D+2,H+2,W+2)
-
-    # 26 neighbor shifts
-    shifts = [(dz,dy,dx) for dz in (-1,0,1) for dy in (-1,0,1) for dx in (-1,0,1)
-              if not (dz==0 and dy==0 and dx==0)]
-
-    neigh_units = []
-    neigh_valids = []
-    for dz,dy,dx in shifts:
-        zs = slice(1+dz, 1+dz+D)
-        ys = slice(1+dy, 1+dy+H)
-        xs = slice(1+dx, 1+dx+W)
-        neigh_units.append(pad_unit[:, zs, ys, xs])     # (3,D,H,W)
-        neigh_valids.append(pad_valid[:, zs, ys, xs])   # (1,D,H,W)
-
-    # (26,3,D,H,W) にしてコサイン一括計算
-    neigh_units = torch.stack(neigh_units, dim=0)   # (26,3,D,H,W)
-    neigh_valids = torch.stack(neigh_valids, dim=0) # (26,1,D,H,W)
-    # cos = <u, v_nb>
-    cos_sim = (neigh_units * unit[None, ...]).sum(dim=1)  # (26,D,H,W)
-
-    # 閾値 & 隣も有効
-    cos_thr = float(cos(radians(threshold_deg)))
-    valid_pair = (cos_sim >= cos_thr) & (neigh_valids.squeeze(1) > 0.5) & src_valid  # ブロードキャストで (26,D,H,W)
-
-    # 進行先: cos 最大の近傍を選ぶ（無い所は next=-1）
-    # 無効な候補を -inf にして argmax
-    cos_masked = torch.where(valid_pair, cos_sim, torch.tensor(float("-inf"), device=dev))
-    best_idx = cos_masked.argmax(dim=0)                          # (D,H,W) 0..25
-    has_next = (cos_masked.max(dim=0).values > -1e30) & src_valid  # (D,H,W)
-
-    # best shift → next のインデックス（線形）を作成
-    # まず現在の線形index
-    z = torch.arange(D, device=dev)[:, None, None]
-    y = torch.arange(H, device=dev)[None, :, None]
-    x = torch.arange(W, device=dev)[None, None, :]
-
-    # best shift（dz,dy,dx）をテンソル化して引く
-    shift_map = torch.tensor(shifts, device=dev, dtype=torch.int64)  # (26,3)
-    dz = shift_map[best_idx, 0]  # (D,H,W)
-    dy = shift_map[best_idx, 1]
-    dx = shift_map[best_idx, 2]
-
-    nz = (z + dz).clamp(0, D-1)
-    ny = (y + dy).clamp(0, H-1)
-    nx = (x + dx).clamp(0, W-1)
-    next_lin = (nz * (H*W) + ny * W + nx)  # (D,H,W)
-    # 端の clamping で“その場”になる場合を無効化（本来は has_next がFalseになっている想定だが二重保険）
-    same_pos = (nz==z) & (ny==y) & (nx==x)
-    has_next = has_next & (~same_pos)
-
-    # next table: (-1) or next_lin
-    next_table = torch.where(has_next, next_lin, torch.full_like(next_lin, -1))
-
-    # 入次数（誰かに指されているか）
-    flat_next = next_table.view(-1)
-    flat_mask = flat_next >= 0
-    in_deg = torch.bincount(flat_next[flat_mask], minlength=D*H*W)  # (DHW,)
-
-    # スタート候補 = src_valid & has_next & (in_deg==0)
-    flat_src_valid = src_valid.view(-1)
-    flat_has_next = has_next.view(-1)
-    starts_mask = (flat_src_valid & flat_has_next & (in_deg == 0))
-
-    start_lin = starts_mask.nonzero(as_tuple=False).squeeze(1)  # (Ns,)
-    if start_lin.numel() == 0:
-        # すべて閉路などでスタートが無い場合、便宜的に has_next の中から代表サンプルを開始点にする
-        start_lin = (flat_src_valid & flat_has_next).nonzero(as_tuple=False).squeeze(1)
-
-    if start_lin.numel() == 0:
-        # 何もつながらない
-        empty_v = torch.empty((0,3), device=dev, dtype=dtype_in)
-        empty_e = torch.empty((0,2), device=dev, dtype=torch.long)
-        return empty_v, empty_e
-
-    # ポインタジャンプ（並列トレース）
-    curr = start_lin.clone()
-    last = curr.clone()
-    step = 0
-    if max_steps is None:
-        max_steps = D + H + W  # 十分大きければOK（局所経路なので多くは早期収束）
-
-    flat_next_table = next_table.view(-1)
-    active = torch.ones_like(curr, dtype=torch.bool)
-
-    seen = torch.full((D*H*W,), -1, device=dev, dtype=torch.int64)  # サイクル検出（訪問済み世代）
-    gen = 1
-    # 訪問印を初期化
-    seen[curr] = gen
-
-    while active.any() and step < max_steps:
-        nxt = flat_next_table[curr]                      # 次インデックス（-1 あり）
-        alive = nxt >= 0
-        # 更新
-        curr = torch.where(alive, nxt, curr)
-        active = alive
-        last = torch.where(alive, curr, last)
-
-        # サイクル検出: すでに同世代で訪問済みなら停止
-        collided = (seen[curr] == gen) & active
-        # 衝突したものは停止扱い（last は直前位置になっている）
-        active = active & (~collided)
-
-        # 訪問マーキング
-        seen[curr[active]] = gen
-        step += 1
-
-    # 始点/終点の (z,y,x)
-    sz = (start_lin // (H*W))
-    sy = (start_lin % (H*W)) // W
-    sx = (start_lin % (W))
-
-    ez = (last // (H*W))
-    ey = (last % (H*W)) // W
-    ex = (last % (W))
-
-    # 始点ワールド座標 p0 = (grid + off) * mag
-    # 注意: off は (z,y,x) 順、出力は (x,y,z)
-    p0x = (sx.to(torch.float32) + off[2, sz, sy, sx])
-    p0y = (sy.to(torch.float32) + off[1, sz, sy, sx])
-    p0z = (sz.to(torch.float32) + off[0, sz, sy, sx])
-    p0 = torch.stack([p0x, p0y, p0z], dim=1) * float(mag)  # (Ns,3)
-
-    # 終点ワールド座標 p1 = (grid + off + tgt) * mag
-    p1x = (ex.to(torch.float32) + off[2, ez, ey, ex] + tgt[2, ez, ey, ex])
-    p1y = (ey.to(torch.float32) + off[1, ez, ey, ex] + tgt[1, ez, ey, ex])
-    p1z = (ez.to(torch.float32) + off[0, ez, ey, ex] + tgt[0, ez, ey, ex])
-    p1 = torch.stack([p1x, p1y, p1z], dim=1) * float(mag)  # (Ns,3)
-
-    # 0長エッジ除去
-    nonzero = (torch.linalg.norm(p1 - p0, dim=1) > 1e-6)
-    p0 = p0[nonzero]
-    p1 = p1[nonzero]
-    Ns = p0.size(0)
-    if Ns == 0:
-        empty_v = torch.empty((0,3), device=dev, dtype=dtype_in)
-        empty_e = torch.empty((0,2), device=dev, dtype=torch.long)
-        return empty_v, empty_e
-
-    # --- 頂点配列とエッジ（[start_idx, end_idx]） ---
-    # （始点,終点）を連結して 2*Ns 個の頂点を作り、後でマージ
-    verts = torch.cat([p0, p1], dim=0)  # (2Ns,3)
-    edges = torch.stack([torch.arange(Ns, device=dev), torch.arange(Ns, device=dev)+Ns], dim=1)  # (Ns,2)
-
-    # --- 近接頂点マージ（グリッドハッシュ近似、O(N)） ---
-    if merge_radius and merge_radius > 0.0 and verts.size(0) > 1:
-        cell = float(merge_radius)
-        keys = torch.floor(verts / cell).to(torch.int64)  # (2Ns,3)
-        # 3D キーを 1D にハッシュ（原点からの相対なので衝突は稀）
-        # キーの範囲が広い場合は 64bit ハッシュ
-        primes = torch.tensor([73856093, 19349663, 83492791], device=dev, dtype=torch.int64)
-        h = (keys * primes).sum(dim=1)
-
-        # ソートして同一セルを隣接化
-        order = torch.argsort(h)
-        h_sorted = h[order]
-
-        # 代表頂点のインデックス（セル先頭を代表に）
-        rep = torch.empty_like(order)
-        rep[0] = order[0]
-        for i in range(1, order.numel()):
-            if h_sorted[i] == h_sorted[i-1]:
-                rep[i] = rep[i-1]
-            else:
-                rep[i] = order[i]
-
-        # 元の順序に戻すための old->rep マップ
-        old2rep = torch.empty_like(rep)
-        old2rep[order] = rep
-
-        # 代表座標で頂点を置換（代表点に吸着）
-        verts = verts[rep.unique(sorted=True)]
-        # old index -> new compact index
-        uniq_rep = rep.unique(sorted=True)
-        new_id = torch.full((2*Ns,), -1, device=dev, dtype=torch.int64)
-        new_id[uniq_rep] = torch.arange(uniq_rep.numel(), device=dev, dtype=torch.int64)
-
-        # エッジの張替え
-        e = edges.clone()
-        e = torch.stack([new_id[old2rep[e[:,0]]], new_id[old2rep[e[:,1]]]], dim=1)
-        # 自己ループ/重複除去
-        valid = e[:,0] != e[:,1]
-        e = e[valid]
-        if e.numel() > 0:
-            e = torch.unique(e, dim=0)
-        edges = e
-
-    # dtype を入力に合わせる
-    verts = verts.to(dtype_in)
-
-    return verts, edges
-
-
-def postprocess3D(
-    prediction: torch.Tensor,  # (B, D, H, W, 6)
-    mag: float,
-    threshold_deg: float = 10.0,
-    min_norm: float = 1e-4,
-    merge_radius: float = 10.0,
-):    
-    """
-    バッチ版ポストプロセス。各サンプルに対して (vertices, edges, index_map) を返す。
-    """  
-    
-    assert prediction.dim() == 5 and prediction.size(1) == 6#9
-    outs = []
-    for b in range(prediction.size(0)):
-        v, e, im = cluster_vectors3D_torch(
-            prediction[b],
-            mag=mag,
-            min_norm=min_norm,
-            merge_radius=merge_radius,
-        )
-        outs.append([v, e, im])
-    return outs
 
 def postprocess2D(
     prediction: torch.Tensor,  # (B, 12,H, W)

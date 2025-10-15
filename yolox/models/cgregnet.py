@@ -10,7 +10,7 @@ from yolox.utils import (
 )
 from typing import Tuple
 import time
-from yolox.models.losses import chamfer_distance,IoU3D
+from yolox.models.losses import chamfer_distance,IoU3D_voxel
 
 
 class TripleViewEncoder(nn.Module):
@@ -83,7 +83,8 @@ class LowRankVoxelFusion(nn.Module):
             nn.BatchNorm2d(self.out_channels),
             #nn.Flatten(2, 3)
         )
-        
+        self.bn3d = nn.BatchNorm3d(num_features=6)
+        self.softsign = nn.Softsign()
     def forward(self, front,side,top):
         front = self.decoder_front(front)
         side = self.decoder_side(side)
@@ -96,7 +97,10 @@ class LowRankVoxelFusion(nn.Module):
             side.view(-1, 6, self.out_channels//6, W, Z),
             top.view(-1, 6, self.out_channels//6, Z, H),
         ) / (self.out_channels/6)
-        return  torch.tanh(voxel)
+         
+        voxel_bn = self.bn3d(voxel)
+        
+        return  self.softsign(voxel_bn)#torch.tanh(voxel_bn)
 
 class TriView2CoordGrid(nn.Module):
     """エンドツーエンドネットワーク"""
@@ -108,36 +112,56 @@ class TriView2CoordGrid(nn.Module):
     def forward(self, x,labels=None,reduction_mag=None):
         
         front, top, side = self.encoder(x)
-        coord_grid = self.decoder(front, side,top)
+        vector_field_y = self.decoder(front, side,top)
         if self.training:
             assert labels is not None, "Training requires target labels" 
             assert reduction_mag is not None, "Training requires reduction_mag"
             # 無効体素マスク（0=valid, 1=ignore）: 和ベクトルの絶対値 < 1e-5
-            with torch.no_grad():
+            #with torch.no_grad():
                 # 4ch 和ノルムではなく、元コード同様「6ch 合計の絶対値 < eps」で判定
-                mag = coord_grid.sum(dim=1).abs()                   # (B, D, H, W)
-                ignore_mask = (mag < 1e-5)                          # bool でも可
+            #    ignore_mask = (vector_field_y.sum(dim=1).abs() < 1e-5) # (B, D, H, W)        # bool でも可
 
             # ベクトル場の損失を計算
             
             joint_list = labels
             torch.cuda.synchronize(); t0 = time.time()    
-            label_grid_3D,ignore_mask= self.data_procces_torch(coord_grid,joint_list,reduction_mag)
+            vector_field_t,ignore_mask= self.data_procces_torch(vector_field_y,joint_list,reduction_mag)
             torch.cuda.synchronize(); t1 = time.time()
-            # 必要なら dtype を coord_grid に合わせる
-            #label_grid_3D = label_grid_3D.to(coord_grid.dtype)
+            print(f"Label grid build time: {t1-t0:.4f}s")            
+            
+            
+            torch.cuda.synchronize(); t0 = time.time()
+            groundpolygon = postprocess3D(vector_field_t,reduction_mag)
             torch.cuda.synchronize(); t1 = time.time()
+            predictpolygon = postprocess3D(vector_field_y,reduction_mag)
+            torch.cuda.synchronize(); t2 = time.time()
+            print(f"Ground polygon processing time: {t1-t0:.4f}s  Predict polygon processing time: {t2-t1:.4f}s")
+
             
             loss,loss_offset,loss_chamfer,loss_IoU3D= self.loss_all(
-                    coord_grid, 
-                    label_grid_3D, 
+                vector_field_y,
+                vector_field_t,
+                    groundpolygon, 
+                    predictpolygon, 
                     ignore_mask,
                     reduction_mag)
-            torch.cuda.synchronize(); t2 = time.time()
-            print(f"Label grid build time: {t1-t0:.4f}s, Loss calculation time: {t2-t1:.4f}s")
+
             return loss,loss_offset,loss_chamfer,loss_IoU3D  
         else:
-            return coord_grid#(B,6,D,H,W)
+            
+            pred=postprocess3D(vector_field_y,8)
+            #groups_as_list(vector_field_y[1])
+            
+            
+            
+            return pred[0],pred[1]#[0],groups_as_list(vector_field_y[1])
+    
+    
+    
+    
+    
+    
+    
     
     @torch.no_grad()
     def data_procces_torch(
@@ -150,15 +174,13 @@ class TriView2CoordGrid(nn.Module):
         
         """
         Returns:
-            pafs:         (B, 6, D, H, W)[off_z, off_y, off_x, tgt_z, tgt_y, tgt_x,
-                                            face_normal1_z, face_normal1_y, face_normal1_x]  
+            pafs:         (B, 6, D, H, W)[off_z, off_y, off_x, tgt_z, tgt_y, tgt_x]  
             ignore_mask:  [B, 1,  D,H, W]  (0=valid, 1=ignore)
         """
         device = x.device
         B, _,D, H, W = x.shape
         r = float(reduction_mag)
-        pafs   = torch.zeros((B, 6, D, H, W), device=device, dtype=torch.float32)
-        #normal_hits = torch.zeros((B, 1, D, H, W), device=device, dtype=torch.int32)    # 寄与数
+        pafs   = torch.zeros((B, 6, D, H, W), device=device, dtype=torch.float32) 
         
         jl = joint_list.to(device=device, dtype=torch.float32)  # [B,N,F,4,3]
         
@@ -167,51 +189,68 @@ class TriView2CoordGrid(nn.Module):
         B_, N, F, _, _ = jl.shape
         assert B_ == B
         # 事前に 26近傍の厚みテーブルを用意（半ボクセル単位: 0.5, √2/2, √3/2）
-        sqrt3_2 = 0.866
-        sqrt2_2 = 0.707
-        demc2_2 = 0.500
+        import math
+        # しきい値カーネル（z,y,x）
+        sqrt3_2 = math.sqrt(3.0) * 0.5        # 0.866025403784...
+        sqrt2_2 = math.sqrt(2.0) * 0.5        # 0.707106781186...
+        demc2_2 = 0.5
+
+
         th_kernel = torch.tensor([
-                [[sqrt3_2,sqrt2_2,sqrt3_2],
-                [sqrt2_2,demc2_2,sqrt2_2],
-                [sqrt3_2,sqrt2_2,sqrt3_2]],
-                [[sqrt2_2,demc2_2,sqrt2_2],
-                [demc2_2,demc2_2,demc2_2],
-                [sqrt2_2,demc2_2,sqrt2_2]],
-                [[sqrt3_2,sqrt2_2,sqrt3_2],
-                [sqrt2_2,demc2_2,sqrt2_2],
-                [sqrt3_2,sqrt2_2,sqrt3_2]],
-            ], device=device, dtype=torch.float32)*0.75  # [3,3,3]
-        # 全要素ゼロのエッジを除外（[B,N,F]）
-        valid_mask = jl.abs().sum(dim=(3,4)) > 0
-        
+            [[sqrt3_2, sqrt2_2, sqrt3_2],
+            [sqrt2_2, demc2_2, sqrt2_2],
+            [sqrt3_2, sqrt2_2, sqrt3_2]],
+
+            [[sqrt2_2, demc2_2, sqrt2_2],
+            [demc2_2, demc2_2, demc2_2],
+            [sqrt2_2, demc2_2, sqrt2_2]],
+
+            [[sqrt3_2, sqrt2_2, sqrt3_2],
+            [sqrt2_2, demc2_2, sqrt2_2],
+            [sqrt3_2, sqrt2_2, sqrt3_2]],
+        ], device=  "cuda", dtype=torch.float32)#*0.75  # (3,3,3)
+
+        def _k_smallest_mask(dist: torch.Tensor, k: int = 3) -> torch.Tensor:
+            """
+            dist: 任意形状（最後は空間格子）。全体の中から距離の小さい順に k 個だけ True。
+            """
+            flat = dist.view(-1)
+            k = min(k, flat.numel())
+            # k個の閾値を topk で取得（小さい方からk個 → largest=False）
+            vals, idx = torch.topk(flat, k, largest=False, sorted=False)
+            mask = torch.zeros_like(flat, dtype=torch.bool)
+            mask[idx] = True
+            return mask.view_as(dist)
+        def _single_argmin_mask(dist: torch.Tensor) -> torch.Tensor:
+            """
+            dist: (..., dz, dy, dx)
+            戻り値: dist と同形状の bool。グローバル最小の1点のみ True。
+            """
+            flat_idx = dist.view(-1).argmin()
+            mask = torch.zeros_like(dist, dtype=torch.bool)
+            mask.view(-1)[flat_idx] = True
+            return mask
+
+
         def draw_view(b: int, vertices: torch.Tensor):
-            #CCWなので任意の3点から法線ベクトルを求める
-            v0 = vertices[0]
-            v1 = vertices[1]
-            v2 = vertices[2]
+            # 頂点列をループエッジとして扱う（v[i-1] -> v[i]）
+            V = vertices.shape[0]
+            if V < 2:
+                return
 
-            # 辺ベクトルを計算
-            e1 = v1 - v0
-            e2 = v2 - v0
-
-            # 外積で法線を計算
-            cross = torch.cross(e1, e2)
-            normal = cross / (torch.sqrt((cross*cross).sum()) + 1e-8) 
-
-            for v_ix in range(len(vertices)):
-                    
-                # A3,B3 をスケーリング
-                A3 = vertices[v_ix-1] / r
+            for v_ix in range(V):
+                # A3,B3 をスケール1/rでグリッド座標へ
+                A3 = vertices[(v_ix - 1) % V] / r
                 B3 = vertices[v_ix] / r
-                sqrt3 = 1.7320508075688772
-                
-                vec  = B3 - A3               # [3]
-                norm2 = (vec *vec).sum()
-                # scalar
-                if (norm2 < 1e-8).item():
+
+                vec = B3 - A3               # [3]
+                norm2 = (vec * vec).sum()
+                if norm2.item() < 1e-8:
                     continue
+
                 vx, vy, vz = vec
 
+                # 対象領域（半ボクセルの余白付き）
                 min_x = int(torch.clamp(torch.floor(torch.min(A3[0], B3[0]) - 0.5), 0, W).item())
                 max_x = int(torch.clamp(torch.ceil (torch.max(A3[0], B3[0]) + 0.5), 0, W).item())
                 min_y = int(torch.clamp(torch.floor(torch.min(A3[1], B3[1]) - 0.5), 0, H).item())
@@ -226,174 +265,109 @@ class TriView2CoordGrid(nn.Module):
                 xs = torch.arange(min_x, max_x, device=device, dtype=torch.float32)
                 Zc, Yc, Xc = torch.meshgrid(zs + 0.5, ys + 0.5, xs + 0.5, indexing="ij")  # (dz,dy,dx)
 
-                
+                # 線分ABへの最近点H（各セル中心からの射影）
                 APx = Xc - A3[0]; APy = Yc - A3[1]; APz = Zc - A3[2]
-                denom = vx*vx + vy*vy + vz*vz + 1e-12
+                denom = vx * vx + vy * vy + vz * vz + 1e-12
                 t = (APx * vx + APy * vy + APz * vz) / denom
                 t = t.clamp_(0.0, 1.0)
                 Hx = A3[0] + t * vx
                 Hy = A3[1] + t * vy
                 Hz = A3[2] + t * vz
+
+                # セル中心→線分の距離
                 dist = torch.sqrt((Xc - Hx)**2 + (Yc - Hy)**2 + (Zc - Hz)**2)
-                
+
+                # 3×3×3のしきい値を位置オフセットで引く
                 dx_off = torch.clamp(torch.floor(Hx - Xc - 0.5), -1, 1).to(torch.long)  # ∈{-1,0,1}
                 dy_off = torch.clamp(torch.floor(Hy - Yc - 0.5), -1, 1).to(torch.long)
-                dz_off = torch.clamp(torch.floor(Hz - Zc - 0.5), -1, 1).to(torch.long)            # [0,1,2] へシフトして 3×3×3 テーブルを引く
+                dz_off = torch.clamp(torch.floor(Hz - Zc - 0.5), -1, 1).to(torch.long)
                 ix = dx_off + 1
                 iy = dy_off + 1
                 iz = dz_off + 1
+                th_local = th_kernel[iz, iy, ix]  # (dz,dy,dx)
 
-                # 体積の各位置ごとにしきい値取得（broadcast でそのまま高次元インデクシング可）
-                th_local = th_kernel[iz, iy, ix]  
-                            
-                off_xa_all = A3[0] - Xc
-                off_ya_all = A3[1] - Yc
-                off_za_all = A3[2] - Zc
-                            
-                
-                off_xb_all = B3[0] - Xc
-                off_yb_all = B3[1] - Yc
-                off_zb_all = B3[2] - Zc
-                
-                
-                distoffA2_3d = torch.sqrt(
-                                    off_xa_all*off_xa_all + 
-                                    off_ya_all*off_ya_all + 
-                                    off_za_all*off_za_all)
-                distoffB2_3d = torch.sqrt(
-                                    off_xb_all*off_xb_all + 
-                                    off_yb_all*off_yb_all + 
-                                    off_zb_all*off_zb_all)
-                mask_B_off = distoffB2_3d < distoffA2_3d
+                # ドロー対象
+                draw = dist <= th_local
+                if not bool(draw.any().item()):
+                    continue
 
-                min_dist_mask_offA3 = distoffA2_3d == distoffA2_3d.min()
-                min_dist_mask_offB3 = distoffB2_3d == distoffB2_3d.min()
-                min_dist_mask_off = min_dist_mask_offA3 | min_dist_mask_offB3
-                
-                off_x = torch.where(mask_B_off, off_xb_all, off_xa_all)
-                off_y = torch.where(mask_B_off, off_yb_all, off_ya_all)
-                off_z = torch.where(mask_B_off, off_zb_all, off_za_all)
-                
-                 
-                off_x = torch.where(off_x==0, 1e-3, off_xa_all)
-                off_y = torch.where(off_y==0, 1e-3, off_ya_all)
-                off_z = torch.where(off_z==0, 1e-3, off_za_all)
-                
-                
-                off_x = off_x*min_dist_mask_off 
-                off_y = off_y*min_dist_mask_off
-                off_z = off_z*min_dist_mask_off
-                
-                off_norm = torch.sqrt(off_x*off_x + off_y*off_y + off_z*off_z)
-                use_perp = (off_norm > sqrt3)
-                #off_x = torch.where(use_perp, 0, off_x)
-                #off_y = torch.where(use_perp, 0, off_y)
-                #off_z = torch.where(use_perp, 0, off_z)
-                
-                                        
+                # A/B への相対オフセット（最近の始点側を採用）
+                off_xa = A3[0] - Xc; off_ya = A3[1] - Yc; off_za = A3[2] - Zc
+                off_xb = B3[0] - Xc; off_yb = B3[1] - Yc; off_zb = B3[2] - Zc
+                dA2 = off_xa*off_xa + off_ya*off_ya + off_za*off_za
+                dB2 = off_xb*off_xb + off_yb*off_yb + off_zb*off_zb
+                use_B = dB2 < dA2
+
+                # A/Bの“最も近い3点”だけ残す（==min をやめ、argmin で単一点）
+                # A側
+                a_mask =_k_smallest_mask(dA2)
+                # B側
+                b_mask = _k_smallest_mask(dB2)
+                keep_mask = a_mask | b_mask
+
+                off_x = torch.where(use_B, off_xb, off_xa)
+                off_y = torch.where(use_B, off_yb, off_ya)
+                off_z = torch.where(use_B, off_zb, off_za)
+
+                # 最小点のみ残す
+                off_x = off_x * keep_mask
+                off_y = off_y * keep_mask
+                off_z = off_z * keep_mask
+
+                # tgt（H→A もしくは H→B の単位ベクトル、近い方）
                 ACx = A3[0] - Hx; ACy = A3[1] - Hy; ACz = A3[2] - Hz
                 BCx = B3[0] - Hx; BCy = B3[1] - Hy; BCz = B3[2] - Hz
+                dA = torch.sqrt(ACx*ACx + ACy*ACy + ACz*ACz + 1e-12)
+                dB = torch.sqrt(BCx*BCx + BCy*BCy + BCz*BCz + 1e-12)
+                use_B2 = dB < dA
 
-                distA = torch.sqrt(ACx*ACx + ACy*ACy + ACz*ACz)
-                distB = torch.sqrt(BCx*BCx + BCy*BCy + BCz*BCz)
-                mask_B = distB < distA
+                tgt_x = torch.where(use_B2, BCx, ACx)
+                tgt_y = torch.where(use_B2, BCy, ACy)
+                tgt_z = torch.where(use_B2, BCz, ACz)
+                #tgt_norm = torch.sqrt(tgt_x*tgt_x + tgt_y*tgt_y + tgt_z*tgt_z + 1e-12)
+                #tgt_x = tgt_x / tgt_norm
+                #tgt_y = tgt_y / tgt_norm
+                #tgt_z = tgt_z / tgt_norm
+                ms = int(math.ceil(math.sqrt(D*D + H*H + W*W)))
+                    # 両方向なので片側あたり T = ceil(ms/2)
+                T = max(1, (ms + 1)//2)
+                tgt_x /= T
+                tgt_y /= T
+                tgt_z /= T
+                
 
-                tgt_x = torch.where(mask_B, BCx, ACx)
-                tgt_y = torch.where(mask_B, BCy, ACy)
-                tgt_z = torch.where(mask_B, BCz, ACz)
-                # tgt_*を単位ベクトルに変換
-                tgt_norm = torch.sqrt(tgt_x*tgt_x + tgt_y*tgt_y + tgt_z*tgt_z + 1e-8)
-                tgt_x = tgt_x / tgt_norm
-                tgt_y = tgt_y / tgt_norm
-                tgt_z = tgt_z / tgt_norm
-
-                # --- 辺の中点（グリッド座標系で） ---
+                # 中点Pに最も近い“tgtの終端”一つだけ残す（argminで単一点）
                 Px = (A3[0] + B3[0]) * 0.5
                 Py = (A3[1] + B3[1]) * 0.5
                 Pz = (A3[2] + B3[2]) * 0.5
+                # 単位ベクトルなのでそのまま1ステップ先を終端とする
+                ex = Xc + tgt_x
+                ey = Yc + tgt_y
+                ez = Zc + tgt_z
+                d_end = torch.sqrt((ex - Px)**2 + (ey - Py)**2 + (ez - Pz)**2)
+                keep_tgt = _single_argmin_mask(d_end)
+                tgt_x = tgt_x * keep_tgt
+                tgt_y = tgt_y * keep_tgt
+                tgt_z = tgt_z * keep_tgt
 
-                # torchで丸め＆クリップ → グローバル整数座標
-                gx = int(torch.clamp(torch.round(Px), 0, W - 1))
-                gy = int(torch.clamp(torch.round(Py), 0, H - 1))
-                gz = int(torch.clamp(torch.round(Pz), 0, D - 1))
-                #lx = gx - min_x
-                #ly = gy - min_y
-                #lz = gz - min_z
-                #if not (0 <= lx < (max_x - min_x) and 0 <= ly < (max_y - min_y) and 0 <= lz < (max_z - min_z)):
-                #    continue  # 念のため
-                # tgt_*ベクトルのノルム
-                tgt_norm = torch.sqrt(tgt_x ** 2 + tgt_y ** 2 + tgt_z ** 2 + 1e-8)
+                # 書き込み：未使用セルかつ draw の位置だけに限定して書く
+                patch = pafs[b, :, min_z:max_z, min_y:max_y, min_x:max_x]  # [6, dz, dy, dx]
 
-                # tgt_*ベクトルの始点から中点Pへの距離
-                tgt_end_x = Xc + tgt_x * tgt_norm
-                tgt_end_y = Yc + tgt_y * tgt_norm
-                tgt_end_z = Zc + tgt_z * tgt_norm
-                dist_tgt_end_to_p = torch.sqrt((tgt_end_x - Px) ** 2 + (tgt_end_y - Py) ** 2 + (tgt_end_z - Pz) ** 2)
-
-                # tgt_*ベクトルのうち、点Pに最も近いものだけ残す
-                min_dist_mask = dist_tgt_end_to_p == dist_tgt_end_to_p.min()
-                tgt_x = tgt_x * min_dist_mask
-                tgt_y = tgt_y * min_dist_mask
-                tgt_z = tgt_z * min_dist_mask
-                lz,ly,lx = min_dist_mask.nonzero(as_tuple=False)[0]
-
-                #off領域にも法線ベクトルマッピング
-                normal_x = torch.where(use_perp, 0, normal[0])
-                normal_y = torch.where(use_perp, 0, normal[1])
-                normal_z = torch.where(use_perp, 0, normal[2])
-                normal_x[lz,ly,lx] = normal[0]
-                normal_y[lz,ly,lx] = normal[1]
-                normal_z[lz,ly,lx] = normal[2]
-                
-                draw = dist <= th_local
-                #if not draw.any().item():
-                #    return
-
-                patch = pafs[b, :, min_z:max_z,min_y:max_y, min_x:max_x]
-                
-                vals = [off_z,off_y, off_x,
-                        tgt_z,tgt_y,tgt_x,
-                        #normal_x,normal_y,normal_z,
-                        ]
+                vals = [off_z, off_y, off_x, tgt_z, tgt_y, tgt_x]  # [6, dz, dy, dx]
                 for i, val in enumerate(vals):
-                    mask = (patch[i] != 0)
-                    if i < 3:
-                        patch[i][~mask] = val[~mask] * draw[~mask]    
-                    elif i < 6:    
-                        patch[i][~mask] = val[~mask]
-                    #else:
-                    #    if i==6:
-                    #        normal_hits[b,0, gz, gy, gx] += 1
-                    #    patch[i][~mask] += val[~mask] #* draw[~mask] 
-                blk=0
+                    free = (patch[i] == 0) #& draw
+                    patch[i][free] = val[free]
             return
-        # 1面ずつ
+        # 全要素ゼロのエッジを除外（[B,N,F]） 
+        valid_mask = jl.abs().sum(dim=(3,4)) > 0
         for b in range(B):
             # flatten: [N,F] -> [M]
             idxs = torch.nonzero(valid_mask[b], as_tuple=False)  # [K,2] (n,e)
             if idxs.numel() == 0:
                 continue
-            flag=False
             for nf in idxs:
                 n, f = int(nf[0].item()), int(nf[1].item())
-                #debug
-                #if n in [0,1,6,7,8,9,10,11]:
-                #    flag=True
-                    #A3, B3 = jl[b, n, f, 0], jl[b, n, f, 1]  # [3]
                 draw_view(b, jl[b, n, f])  # xyz
-                #elif flag:
-                #    break
-            #hits = normal_hits.to(pafs.dtype)                   # float化
-            #mask = hits > 0
-#
-#            # 0割対策（ヒット無しはそのままにしたい場合は where を使う）
-            #safe_hits = torch.where(mask, hits, torch.ones_like(hits))
-#
-#            # 平均
-            #pafs[:, 3, ...] = torch.where(mask[:,0], pafs[:, 3, ...] / safe_hits[:,0], pafs[:, 3, ...])
-            #pafs[:, 4, ...] = torch.where(mask[:,0], pafs[:, 4, ...] / safe_hits[:,0], pafs[:, 4, ...])
-            #pafs[:, 5, ...] = torch.where(mask[:,0], pafs[:, 5, ...] / safe_hits[:,0], pafs[:, 5, ...])
-
             block = pafs[:, :]              # [B,6,D,H,W]
             
             power = (block *block).sum(dim=1).sqrt()
@@ -406,8 +380,10 @@ class TriView2CoordGrid(nn.Module):
 
             
     def loss_all(self,
-                    vector_field_y, 
-                    vector_field_t, 
+                 vector_field_y, 
+                 vector_field_t,
+                   groundpolygon, 
+                    predictpolygon,  
                     vector_field_masks,mag):
 
         def mean_square_error(pred, target):
@@ -417,31 +393,87 @@ class TriView2CoordGrid(nn.Module):
 
         loss_total = 0
 
-        torch.cuda.synchronize(); t0 = time.time()
-        groundpolygon = postprocess3D(vector_field_t,mag)
-        torch.cuda.synchronize(); t1 = time.time()
-        predictpolygon = postprocess3D(vector_field_y,mag)
         torch.cuda.synchronize(); t2 = time.time()
-        print(f"Ground polygon processing time: {t1-t0:.4f}s  Predict polygon processing time: {t2-t1:.4f}s")
         loss_chamfer = chamfer_distance(predictpolygon, groundpolygon)
-        _,loss_IoU3D = IoU3D(predictpolygon, groundpolygon)
+        _,loss_IoU3D = IoU3D_voxel(predictpolygon, groundpolygon)
         torch.cuda.synchronize(); t3 = time.time()
-        print(f"Chamfer loss calculation time: {t3-t2:.4f}s")
-        pafs_off_y = torch.stack((
-            vector_field_y[:, 0],
-            vector_field_y[:, 1],
-            vector_field_y[:, 2],
-        ), dim=1)
-        pafs_off_t = torch.stack((
-            vector_field_t[:, 0],
-            vector_field_t[:, 1],
-            vector_field_t[:, 2],
-        ), dim=1)
+        print(f"Chamfer&IoU3D loss calculation time: {t3-t2:.4f}s")
+        #pafs_off_y = torch.stack((
+        #    vector_field_y[:, 0],
+        #    vector_field_y[:, 1],
+        #    vector_field_y[:, 2],
+        #), dim=1)
+        #pafs_off_t = torch.stack((
+        #    vector_field_t[:, 0],
+        #    vector_field_t[:, 1],
+        #    vector_field_t[:, 2],
+        #), dim=1)
         
-        loss_offset = mean_square_error(pafs_off_y, pafs_off_t)
-        loss_total += loss_offset + loss_chamfer + loss_IoU3D
+        loss_off_tgt = mean_square_error(vector_field_y, vector_field_t)
+        loss_total += 10.0*loss_off_tgt + 0.1*torch.log10(loss_chamfer) + loss_IoU3D
 
-        return loss_total,loss_offset,loss_chamfer, loss_IoU3D
+        return loss_total,loss_off_tgt,loss_chamfer, loss_IoU3D
+
+
+
+
+class UnionFind:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, x: int) -> int:
+        p = self.parent
+        while p[x] != x:
+            p[x] = p[p[x]]
+            x = p[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+
+def groups_as_list(rows: torch.Tensor):
+    """
+    rows: (N, M) int tensor (cpu/gpu ok)
+    Rule: Two rows are in the same group if they share >=1 number (transitively).
+    Returns: Python list of groups -> list of row-lists (each row is a list[int])
+    """
+    rows_cpu = rows.detach().to("cpu").long()
+    N, M = rows_cpu.shape
+
+    uf = UnionFind(N)
+    first_row_of_value = {}
+
+    # link rows that share any value
+    for i in range(N):
+        vals = torch.unique(rows_cpu[i]).tolist()
+        for v in vals:
+            if v not in first_row_of_value:
+                first_row_of_value[v] = i
+            else:
+                uf.union(i, first_row_of_value[v])
+
+    # collect rows per root
+    root_to_rows = {}
+    for i in range(N):
+        r = uf.find(i)
+        root_to_rows.setdefault(r, []).append(i)
+
+    # sort groups by smallest row index; keep original row order inside group
+    groups_idx = [sorted(v) for v in root_to_rows.values()]
+    groups_idx.sort(key=lambda xs: xs[0])
+
+    # convert to pure Python list-of-lists-of-ints
+    groups = [rows_cpu[idxs].tolist() for idxs in groups_idx]
+    return groups
+
 
 
 def create_mask_from_target(target_grid, eps=1e-6):

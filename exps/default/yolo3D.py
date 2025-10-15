@@ -16,14 +16,14 @@ class Exp(MyExp):
         self.width = 1.0
         self.exp_name = os.path.split(os.path.realpath(__file__))[1].split(".")[0]
 
-    def get_model(self, sublinear=False):
+    def get_model(self,):
         def init_yolo(M):
             for m in M.modules():
                 if isinstance(m, nn.BatchNorm2d):
                     m.eps = 1e-3
                     m.momentum = 0.03
         if "model" not in self.__dict__:
-            from yolox.models import YOLOx3D,YOLOFPN, YOLOPAFPN, MeshNet, TriView2CoordGrid
+            from yolox.models import YOLOx3D, YOLOPAFPN, MeshNet, TriView2CoordGrid
             backbone = YOLOPAFPN()
             meshnet = MeshNet()
             coordinate3d = TriView2CoordGrid()

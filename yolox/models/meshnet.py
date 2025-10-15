@@ -241,7 +241,7 @@ class MeshNet(Module):
            
             loss_offset = mean_square_error(pafs_off_y, pafs_off_t)           
             loss_target = mean_square_error(pafs_tgt_y,pafs_tgt_t)
-            loss_total += loss_offset + loss_target#+ loss_chamfer_xy + loss_chamfer_yz + loss_chamfer_zx
+            loss_total += 10.0*loss_offset + 10.0*loss_target#+ loss_chamfer_xy + loss_chamfer_yz + loss_chamfer_zx
         torch.cuda.synchronize(); t1 = time.time()
         print(f"mesh loss processing time: {t1-t0:.4f}s")
         return loss_total, loss_offset,loss_target#,loss_chamfer_xy,loss_chamfer_yz,loss_chamfer_zx
