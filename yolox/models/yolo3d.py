@@ -22,9 +22,9 @@ class YOLOx3D(nn.Module):
             
             loss_class,cls_prob = self.classnet(fpn_outs[0],targets["category"],targets["mesh"],8)
             
-            loss_2D,loss_offset2D,loss_target_mask2D,pafs= self.meshnet(
+            loss_2D,loss_offset2D,loss_target2D,pafs= self.meshnet(
                 fpn_outs[0], targets["mesh"],8)
-            loss_3D,loss_offtgt3D,loss_chamfer,loss_3DIoU = self.coordinate3d(
+            loss_3D,loss_offset3D,loss_target3D,loss_chamfer,loss_3DIoU = self.coordinate3d(
                 pafs[-1], targets["mesh"],8)
             total_loss =loss_class + loss_2D + loss_3D 
             outputs = {
@@ -32,12 +32,10 @@ class YOLOx3D(nn.Module):
                 "loss_class": loss_class,
                 "loss_2D":   loss_2D,
                 "loss_offset2D":loss_offset2D,
-                "loss_target_mask2D":loss_target_mask2D,
-                #"loss_loss_chamfer_xy":loss_chamfer_xy,
-                #"loss_loss_chamfer_yz":loss_chamfer_yz,
-                #"loss_loss_chamfer_zx":loss_chamfer_zx,
+                "loss_target2D":loss_target2D,
                 "loss_3D" : loss_3D,
-                "loss_offtgt3D": loss_offtgt3D,
+                "loss_offset3D": loss_offset3D,
+                "loss_target3D": loss_target3D,
                 "loss_chamfer": loss_chamfer,
                 "loss_3DIoU": loss_3DIoU,
             }

@@ -1,3 +1,16 @@
+## Tensorboardコマンド
+```
+tensorboard --logdir  YOLOX_outputs/yolox3D_base/tensorboard/
+
+mv YOLOX_outputs/yolox3D_base/tensorboard/ YOLOX_outputs/yolox3D_base/tensorboard_mmdd_n/
+
+sudo rm -rf YOLOX_outputs/yolox3D_base/tensorboard/
+```
+
+
+
+
+
 <div align="center"><img src="assets/logo.png" width="350"></div>
 <img src="assets/demo.png" >
 

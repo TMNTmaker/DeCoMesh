@@ -513,7 +513,7 @@ def cluster_vectors3D_torch_fast(
     # 打ち切り距離
     stop_d_p = torch.zeros(K, dtype=torch.int32, device=device)
     stop_d_m = torch.zeros(K, dtype=torch.int32, device=device)
-    stop_d_all = torch.zeros(K, dtype=torch.int32, device=device)
+    #stop_d_all = torch.zeros(K, dtype=torch.int32, device=device)
     
     # for 向けに mask_off をクイック参照する関数
     def check_off(nz, ny, nx):
@@ -523,7 +523,7 @@ def cluster_vectors3D_torch_fast(
             out[inb] = mask_off[nz[inb], ny[inb], nx[inb]]
         return out
 
-    # ====== 両方向バッチ歩行（T ステップ固定でテンソル更新）======
+    # ====== 両方向ステップ（T ステップ固定でテンソル更新）======
     
     for it in range(T):
         # 既に止まってるものはスキップ（位置更新もしない）
@@ -650,10 +650,9 @@ def cluster_vectors3D_torch_fast(
 
     # 終点（-側の停止セル）
     o1 = off[:, cz_m, cy_m, cx_m].transpose(0,1) + 0.5
-    p1_grid = torch.stack([cx_m.to(dtypef), cy_m.to(dtypef), cz_m.to(dtypef)], dim=1)
+    p1_grid = torch.stack([cz_m.to(dtypef), cy_m.to(dtypef), cx_m.to(dtypef)], dim=1)
     p1_off  = torch.stack([o1[:,2], o1[:,1], o1[:,0]], dim=1)
     p1 = (p1_grid + p1_off) * mag                               # (K,3) (x,y,z)
-
     
     # 無効（同一点）を除外
     valid_edge = (torch.linalg.norm(p1 - p0, dim=1) > 1e-6)
@@ -668,13 +667,13 @@ def cluster_vectors3D_torch_fast(
 
     # 頂点配列（旧）: 2E 個（[p0,p1] を縦に並べる）
     vertices = torch.cat([p0, p1], dim=0)  # (2E,3)
-    edges    = torch.stack([torch.arange(E, device=device, dtype=torch.long),
-                                torch.arange(E, device=device, dtype=torch.long)+E], dim=1)  # (E,2)
-    group2verts = defaultdict(set)
-    for i in range(E):
-        group2verts[i].add(i)      # p0
-        group2verts[i].add(i+E)    # p1
-        
+    edges_0    = torch.stack([torch.arange(E, device=device, dtype=torch.long),
+                                torch.arange(E, device=device, dtype=torch.long)+E], dim=1)  # (E,2)        
+    edges_1= torch.stack([torch.arange(E, device=device, dtype=torch.long)+E,
+                                torch.arange(E, device=device, dtype=torch.long)], dim=1)  # (E,2)        
+    edges = torch.cat([edges_0, edges_1], dim=0)
+    
+    #num_of_edges = len(edges)
     # === 双方向化
     def make_bidir_pairs(pairs: torch.Tensor, dedup: bool = True) -> torch.Tensor:
         """
@@ -689,7 +688,52 @@ def cluster_vectors3D_torch_fast(
             both = torch.unique(both, dim=0)
         return both
     
-    edges_each = make_bidir_pairs(edges)
+    #edges_each = make_bidir_pairs(edges)
+
+    #merge_vertices = {}
+    #if vertices.size(0) > 1 and merge_radius > 0:
+    #    used_list = []
+    #    #ij_norm_map = np.zeros([vertices.size(0),vertices.size(0)],dtype=float)
+    #    for i in range(vertices.size(0)):
+    #        for j in range(i+1, vertices.size(0)):
+    #            v_i = vertices[i]
+    #            v_j = vertices[j]
+    #            #ij_norm_map[i,j]  = torch.linalg.norm(v_i-v_j)
+    #            if torch.linalg.norm(v_i-v_j) < merge_radius:
+    #                if i in merge_vertices and i not in used_list:
+    #                    merge_vertices[i].append(j)
+    #                    used_list.append(i)
+    #                elif j not in used_list:
+    #                    merge_vertices[i] = [j]
+    #                used_list.append(j)
+    #    reverse_merge_list = {v: k for k, values in merge_vertices.items() for v in values}
+    #    merge_edges = {}
+    #    edge_chain = {}
+    #    for k,v in merge_vertices.items():
+    #        #辺端を代表頂点インデックスに変換
+    #        vertex_next=edges[k][1].item()
+    #        if vertex_next in reverse_merge_list:
+    #            vertex_next=reverse_merge_list[vertex_next]
+    #            merge_edges[k] = [vertex_next]
+    #        else:
+    #            merge_edges[k] = [vertex_next]
+    #            
+    #        for vi in v:
+    #            vertex_next=edges[vi][1].item()
+    #            if vertex_next in reverse_merge_list:
+    #                vertex_next=reverse_merge_list[vertex_next]
+    #                merge_edges[k].append(vertex_next)
+    #            #マージされていない独立した頂点も含める
+    #            else:
+    #                merge_edges[k].append(vertex_next)
+                    
+
+    #group2verts = defaultdict(set)
+    #for i in range(E):
+    #    group2verts[i].add(i)      # p0
+    #    group2verts[i].add(i+E)    # p1
+
+
     # ====== 近接マージ ======
     keep = torch.ones(vertices.size(0), dtype=torch.bool, device=device)
     keep_map = {} # 代表 -> 吸収された旧頂点一覧
@@ -708,7 +752,7 @@ def cluster_vectors3D_torch_fast(
                 dup_idxs = torch.cat([dup_idxs, torch.tensor([i], device=device)])
                 keep_map[i]=dup_idxs        
                 #関連する辺を抽出
-                edge_map[i] = edges_each[dup_idxs,1]
+                edge_map[i] = edges[dup_idxs,1]
 
         if len(edge_map) == 0:
             new_edges = torch.empty((0, 2), dtype=torch.long, device='cuda:0')
@@ -772,8 +816,8 @@ def cluster_vectors3D_torch_fast(
     if len(faces_list) > 0:
         faces = torch.tensor(faces_list, dtype=torch.long, device=device)
         # 同一三角形の重複除去（頂点をソートして一意化）
-        faces_sorted = torch.sort(faces, dim=1).values
-        faces = torch.unique(faces_sorted, dim=0)
+        #faces_sorted = torch.sort(faces, dim=1).values
+        #faces = torch.unique(faces_sorted, dim=0)
     else:
         faces = torch.empty((0,3), dtype=torch.long, device=device)
     
@@ -972,7 +1016,7 @@ def postprocess2D(
     mag: float,
     threshold_deg: float = 5.0,
     min_norm: float = 1e-4,
-    merge_radius: float = 3.0,
+    merge_radius: float = 1.0,
 ):
     """
     バッチ版ポストプロセス。各サンプルに対して (vertices, edges, index_map) を返す。

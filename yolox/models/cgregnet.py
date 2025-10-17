@@ -4,7 +4,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from yolox.utils import (
  postprocess3D
 )
@@ -108,7 +107,8 @@ class TriView2CoordGrid(nn.Module):
         super().__init__()
         self.encoder = TripleViewEncoder()
         self.decoder = LowRankVoxelFusion(in_channels)
-        
+
+
     def forward(self, x,labels=None,reduction_mag=None):
         
         front, top, side = self.encoder(x)
@@ -116,11 +116,6 @@ class TriView2CoordGrid(nn.Module):
         if self.training:
             assert labels is not None, "Training requires target labels" 
             assert reduction_mag is not None, "Training requires reduction_mag"
-            # 無効体素マスク（0=valid, 1=ignore）: 和ベクトルの絶対値 < 1e-5
-            #with torch.no_grad():
-                # 4ch 和ノルムではなく、元コード同様「6ch 合計の絶対値 < eps」で判定
-            #    ignore_mask = (vector_field_y.sum(dim=1).abs() < 1e-5) # (B, D, H, W)        # bool でも可
-
             # ベクトル場の損失を計算
             
             joint_list = labels
@@ -138,29 +133,20 @@ class TriView2CoordGrid(nn.Module):
             print(f"Ground polygon processing time: {t1-t0:.4f}s  Predict polygon processing time: {t2-t1:.4f}s")
 
             
-            loss,loss_offset,loss_chamfer,loss_IoU3D= self.loss_all(
-                vector_field_y,
-                vector_field_t,
+            loss,loss_offset,loss_target,loss_chamfer,loss_IoU3D=\
+                self.loss_all(
+                    vector_field_y,
+                    vector_field_t,
                     groundpolygon, 
                     predictpolygon, 
                     ignore_mask,
                     reduction_mag)
 
-            return loss,loss_offset,loss_chamfer,loss_IoU3D  
+            return loss,loss_offset,loss_target,loss_chamfer,loss_IoU3D  
         else:
-            
             pred=postprocess3D(vector_field_y,8)
             #groups_as_list(vector_field_y[1])
-            
-            
-            
             return pred[0],pred[1]#[0],groups_as_list(vector_field_y[1])
-    
-    
-    
-    
-    
-    
     
     
     @torch.no_grad()
@@ -210,7 +196,7 @@ class TriView2CoordGrid(nn.Module):
             [sqrt3_2, sqrt2_2, sqrt3_2]],
         ], device=  "cuda", dtype=torch.float32)#*0.75  # (3,3,3)
 
-        def _k_smallest_mask(dist: torch.Tensor, k: int = 3) -> torch.Tensor:
+        def _k_smallest_mask(dist: torch.Tensor, k: int = 1) -> torch.Tensor:
             """
             dist: 任意形状（最後は空間格子）。全体の中から距離の小さい順に k 個だけ True。
             """
@@ -275,21 +261,21 @@ class TriView2CoordGrid(nn.Module):
                 Hz = A3[2] + t * vz
 
                 # セル中心→線分の距離
-                dist = torch.sqrt((Xc - Hx)**2 + (Yc - Hy)**2 + (Zc - Hz)**2)
+                #dist = torch.sqrt((Xc - Hx)**2 + (Yc - Hy)**2 + (Zc - Hz)**2)
 
                 # 3×3×3のしきい値を位置オフセットで引く
-                dx_off = torch.clamp(torch.floor(Hx - Xc - 0.5), -1, 1).to(torch.long)  # ∈{-1,0,1}
-                dy_off = torch.clamp(torch.floor(Hy - Yc - 0.5), -1, 1).to(torch.long)
-                dz_off = torch.clamp(torch.floor(Hz - Zc - 0.5), -1, 1).to(torch.long)
-                ix = dx_off + 1
-                iy = dy_off + 1
-                iz = dz_off + 1
-                th_local = th_kernel[iz, iy, ix]  # (dz,dy,dx)
+                #dx_off = torch.clamp(torch.floor(Hx - Xc - 0.5), -1, 1).to(torch.long)  # ∈{-1,0,1}
+                #dy_off = torch.clamp(torch.floor(Hy - Yc - 0.5), -1, 1).to(torch.long)
+                #dz_off = torch.clamp(torch.floor(Hz - Zc - 0.5), -1, 1).to(torch.long)
+                #ix = dx_off + 1
+                #iy = dy_off + 1
+                #iz = dz_off + 1
+                #th_local = th_kernel[iz, iy, ix]  # (dz,dy,dx)
 
-                # ドロー対象
-                draw = dist <= th_local
-                if not bool(draw.any().item()):
-                    continue
+                ## ドロー対象
+                #draw = dist <= th_local
+                #if not bool(draw.any().item()):
+                #    continue
 
                 # A/B への相対オフセット（最近の始点側を採用）
                 off_xa = A3[0] - Xc; off_ya = A3[1] - Yc; off_za = A3[2] - Zc
@@ -380,39 +366,32 @@ class TriView2CoordGrid(nn.Module):
 
             
     def loss_all(self,
-                 vector_field_y, 
-                 vector_field_t,
-                   groundpolygon, 
-                    predictpolygon,  
-                    vector_field_masks,mag):
+                    vector_field_y, 
+                    vector_field_t,
+                    groundpolygon, 
+                    predictpolygon,
+                    ignore_mask,
+                    lambda_offset=10.0,
+                    lambda_target=10.0,
+                    lambda_chamfer = 0.5
+                    ):
 
         def mean_square_error(pred, target):
             assert pred.shape == target.shape, 'x and y should in same shape'
             return torch.sum((pred - target) ** 2) / target.nelement()
-        
-
-        loss_total = 0
 
         torch.cuda.synchronize(); t2 = time.time()
+        #chamfer = lambda_chamfer*torch.log10(chamfer_distance(predictpolygon, groundpolygon))
         loss_chamfer = chamfer_distance(predictpolygon, groundpolygon)
         _,loss_IoU3D = IoU3D_voxel(predictpolygon, groundpolygon)
         torch.cuda.synchronize(); t3 = time.time()
         print(f"Chamfer&IoU3D loss calculation time: {t3-t2:.4f}s")
-        #pafs_off_y = torch.stack((
-        #    vector_field_y[:, 0],
-        #    vector_field_y[:, 1],
-        #    vector_field_y[:, 2],
-        #), dim=1)
-        #pafs_off_t = torch.stack((
-        #    vector_field_t[:, 0],
-        #    vector_field_t[:, 1],
-        #    vector_field_t[:, 2],
-        #), dim=1)
         
-        loss_off_tgt = mean_square_error(vector_field_y, vector_field_t)
-        loss_total += 10.0*loss_off_tgt + 0.1*torch.log10(loss_chamfer) + loss_IoU3D
+        loss_offset = lambda_offset*mean_square_error(vector_field_y[:, [0,1,2]], vector_field_t[:, [0,1,2]])
+        loss_target = lambda_target*mean_square_error(vector_field_y[:, [3,4,5]], vector_field_t[:, [3,4,5]])
+        loss_total = loss_offset + loss_target  #+ loss_IoU3D
 
-        return loss_total,loss_off_tgt,loss_chamfer, loss_IoU3D
+        return loss_total,loss_offset,loss_target,loss_chamfer, loss_IoU3D
 
 
 

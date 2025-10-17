@@ -6,7 +6,7 @@ from typing import List, Tuple, Optional, Union
 
 TensorLike = Union[torch.Tensor, List, torch.Tensor]
 
-#@torch.no_grad()
+@torch.no_grad()
 def chamfer_distance(
     predict: List[List[TensorLike]],
     ground:  List[List[TensorLike]],
@@ -114,27 +114,13 @@ def chamfer_distance(
 import torch
 from typing import List, Tuple, Sequence
 
-
+@torch.no_grad()
 def IoU3D_voxel(
     predict: List[List[TensorLike]],
     ground:  List[List[TensorLike]],
     grid_size: int = 128,
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    3D IoU (voxel 近似版)
-    Args:
-        predict: list length=B, each = [vertices: (Ni,3), faces: (Mi,3), ...]
-        ground : list length=B, each = [vertices: (Oi,3), faces: (Pi,3), ...]
-        grid_size: ボクセル解像度
-    Returns:
-        iou:  (B,) tensor
-        loss: (B,) tensor = 1 - iou
-    注意:
-        - 予測とGTが同一座標系・同一スケールにあるのが前提。
-        - 両者の合成バウンディングボックスで[0,1]正規化して同じ体積に落としてからボクセル化する。
-    """
-
     # ---------- 単一メッシュ用のボクセル化（バッチ非対応） ----------
     def voxelize_mesh_single(
         vertices: torch.Tensor,  # (N,3) in [0,1]
@@ -176,8 +162,8 @@ def IoU3D_voxel(
         return voxels
 
     # ---------- 入力チェック ----------
-    assert len(predict) == len(ground), "バッチ長が一致していません"
-    B = len(predict)
+    assert len(predict[0]) == len(ground[0]), "バッチ長が一致していません"
+    B = len(predict[0])
     if B == 0:
         # 返り値のデバイスは不定なのでCPU返し
         return torch.empty(0), torch.empty(0)
