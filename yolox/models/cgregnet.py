@@ -3,13 +3,12 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from yolox.utils import (
  postprocess3D
 )
 from typing import Tuple
 import time
-from yolox.models.losses import chamfer_distance,IoU3D_voxel
+from yolox.models.losses import *
 
 
 class TripleViewEncoder(nn.Module):
@@ -354,13 +353,13 @@ class TriView2CoordGrid(nn.Module):
             for nf in idxs:
                 n, f = int(nf[0].item()), int(nf[1].item())
                 draw_view(b, jl[b, n, f])  # xyz
-            block = pafs[:, :]              # [B,6,D,H,W]
+            block = pafs[:, :].sum(dim=1).abs()             # [B,6,D,H,W]
             
-            power = (block *block).sum(dim=1).sqrt()
-            ignore_mask = (power < 1e-5).to(torch.uint8).unsqueeze(1)  # [B,1,D,H,W]
-
+            ignore_mask = torch.stack([(block > 1e-5)], 
+                                      dim=1).to(torch.uint8)
         
         if out_dtype is None:
+            
             out_dtype = x.dtype
         return pafs.to(out_dtype), ignore_mask
 
@@ -371,24 +370,21 @@ class TriView2CoordGrid(nn.Module):
                     groundpolygon, 
                     predictpolygon,
                     ignore_mask,
-                    lambda_offset=10.0,
-                    lambda_target=10.0,
-                    lambda_chamfer = 0.5
+                    lambda_offset=500.0,
+                    lambda_target=500.0,
                     ):
-
-        def mean_square_error(pred, target):
-            assert pred.shape == target.shape, 'x and y should in same shape'
-            return torch.sum((pred - target) ** 2) / target.nelement()
-
         torch.cuda.synchronize(); t2 = time.time()
-        #chamfer = lambda_chamfer*torch.log10(chamfer_distance(predictpolygon, groundpolygon))
         loss_chamfer = chamfer_distance(predictpolygon, groundpolygon)
         _,loss_IoU3D = IoU3D_voxel(predictpolygon, groundpolygon)
         torch.cuda.synchronize(); t3 = time.time()
         print(f"Chamfer&IoU3D loss calculation time: {t3-t2:.4f}s")
         
-        loss_offset = lambda_offset*mean_square_error(vector_field_y[:, [0,1,2]], vector_field_t[:, [0,1,2]])
-        loss_target = lambda_target*mean_square_error(vector_field_y[:, [3,4,5]], vector_field_t[:, [3,4,5]])
+        loss_offset = lambda_offset*masked_mse_loss(vector_field_y[:, [0,1,2]], 
+                                                    vector_field_t[:, [0,1,2]],
+                                                    ignore_mask)
+        loss_target = lambda_target*masked_mse_loss(vector_field_y[:, [3,4,5]], 
+                                                    vector_field_t[:, [3,4,5]],
+                                                    ignore_mask)
         loss_total = loss_offset + loss_target  #+ loss_IoU3D
 
         return loss_total,loss_offset,loss_target,loss_chamfer, loss_IoU3D
@@ -455,6 +451,7 @@ def groups_as_list(rows: torch.Tensor):
 
 
 
+
 def create_mask_from_target(target_grid, eps=1e-6):
     """
     target_gridから有効ピクセルマスクを生成
@@ -479,55 +476,3 @@ def create_mask_from_target(target_grid, eps=1e-6):
     valid_mask = ~(zero_mask | nan_mask | inf_mask)
     
     return valid_mask
-def dice_loss(pred, target, eps=1e-6):
-    pred = pred.view(pred.size(0), -1)
-    target = target.view(target.size(0), -1)
-    intersection = (pred * target).sum(1)
-    union = pred.sum(1) + target.sum(1)
-    dice = (2 * intersection + eps) / (union + eps)
-    return 1 - dice.mean()
-
-def masked_bce_loss(pred, target, mask):
-    loss = F.binary_cross_entropy(pred, target, reduction='none')
-    return (loss * mask).sum() / mask.sum()
-
-def asymmetric_loss(pred, target, gamma_pos=0.0, gamma_neg=4.0):
-    eps = 1e-8
-    x_pos = pred
-    x_neg = 1 - pred
-
-    pos_loss = target * torch.log(x_pos + eps) * (1 - x_pos) ** gamma_pos
-    neg_loss = (1 - target) * torch.log(x_neg + eps) * (x_pos) ** gamma_neg
-    loss = - (pos_loss + neg_loss)
-    return loss.mean()
-
-def asymmetric_mse_loss(pred, target, alpha=1.0, beta=0.1):
-    """
-    pred: (B, H, W, D) - sigmoid 出力など
-    target: (B, H, W, D) - binary {0,1}
-    alpha: 前景（target=1）の重み
-    beta: 背景（target=0）の重み
-    """
-    foreground = (target == 1).float()
-    background = 1.0 - foreground
-
-    diff_sq = (pred - target) ** 2
-    weighted_loss = alpha * foreground * diff_sq + beta * background * diff_sq
-    return weighted_loss.mean()
-
-def masked_mse_loss(pred, target, mask, eps=1e-6):
-    """
-    pred: (B, H, W, D)
-    target: (B, H, W, D)
-    mask: (B, H, W, D) または (B, H, W)
-    """
-    # mask を pred/target と同じ形状に拡張
-    if mask.dim() == pred.dim() - 1:
-        mask = mask.unsqueeze(-1).expand_as(pred)
-    else:
-        mask = mask.expand_as(pred)
-    
-    diff = (pred - target) ** 2
-    masked_diff = diff * mask  # 無効領域は 0 に
-    loss = masked_diff.sum() / (mask.sum() + eps)  # avoid divide by zero
-    return loss

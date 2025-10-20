@@ -3,6 +3,89 @@
 # Copyright (c) Megvii Inc. All rights reserved.
 import torch
 from typing import List, Tuple, Optional, Union
+import torch.nn.functional as F
+
+def mean_square_error(pred: torch.Tensor, 
+                      target: torch.Tensor):
+    assert pred.shape == target.shape, 'x and y should in same shape'
+    return torch.sum((pred - target) ** 2) / target.nelement()
+
+
+def dice_loss(pred, target, eps=1e-6):
+    pred = pred.view(pred.size(0), -1)
+    target = target.view(target.size(0), -1)
+    intersection = (pred * target).sum(1)
+    union = pred.sum(1) + target.sum(1)
+    dice = (2 * intersection + eps) / (union + eps)
+    return 1 - dice.mean()
+
+def masked_bce_loss(pred, target, mask):
+    loss = F.binary_cross_entropy(pred, target, reduction='none')
+    return (loss * mask).sum() / mask.sum()
+
+def asymmetric_loss(pred, target, gamma_pos=5.0, gamma_neg=1.0):
+    eps = 1e-8
+    x_pos = pred
+    x_neg = 1 - pred
+
+    pos_loss = target * torch.log(x_pos + eps) * (1 - x_pos) ** gamma_pos
+    neg_loss = (1 - target) * torch.log(x_neg + eps) * (x_pos) ** gamma_neg
+    loss = - (pos_loss + neg_loss)
+    return loss.mean()
+
+def asymmetric_mse_loss(pred, target, alpha=1.0, beta=0.1):
+    """
+    pred: (B, H, W, D) - sigmoid 出力など
+    target: (B, H, W, D) - binary {0,1}
+    alpha: 前景（target=1）の重み
+    beta: 背景（target=0）の重み
+    """
+    foreground = (target == 1).float()
+    background = 1.0 - foreground
+
+    diff_sq = (pred - target) ** 2
+    weighted_loss = alpha * foreground * diff_sq + beta * background * diff_sq
+    return weighted_loss.mean()
+
+def masked_mse(pred, target, mask):
+    # pred/target: [B,12,H,W], mask: [B,3,H,W] (1 = ignore)
+    mask_exp = mask.repeat_interleave(4, dim=1).bool()  # -> [B,12,H,W]
+    valid = ~mask_exp
+    if valid.sum() == 0:
+        return torch.tensor(0., device=pred.device, dtype=pred.dtype)
+    diff = (pred - target) ** 2
+    return diff[valid].mean()
+
+def masked_mse_loss(pred, target, mask, eps=1e-12):
+    # 1) 計算は少なくとも fp32 で
+    pred   = pred.float()
+    target = target.float()
+    #mask を pred/target と同じ形状に拡張 
+    if mask.dim() == pred.dim() - 1: 
+        mask = mask.unsqueeze(1).expand_as(pred) 
+    else: 
+        mask = mask.expand_as(pred)
+    # 2) マスクは bool（>0 を有効）に正規化
+    if mask.dtype is torch.bool:
+        m = mask
+    else:
+        m = mask > 0
+
+    # 3) 入力の有限性チェックで汚染を遮断
+    m = m & torch.isfinite(pred) & torch.isfinite(target)
+
+    valid = m.sum(dtype=torch.float32)
+    if valid == 0:
+        # 有効画素ゼロなら勾配0のスカラーを返す
+        return pred.new_zeros(())
+
+    # 4) “有効な要素だけ” を平均（sum/valid は fp32）
+    diff = (pred - target)**2
+    num  = diff.masked_select(m).sum(dtype=torch.float32)
+    den  = valid  # clamp_min(1) ではなく、valid==0 の分岐で対処済み
+    return num / (den + eps)
+
+
 
 TensorLike = Union[torch.Tensor, List, torch.Tensor]
 

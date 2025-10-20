@@ -412,7 +412,7 @@ def cluster_vectors3D_torch(
 import math
 import torch
 
-#@torch.no_grad()
+@torch.no_grad()
 def cluster_vectors3D_torch_fast(
     vector_field: torch.Tensor,
     mag: float,
@@ -823,6 +823,7 @@ def cluster_vectors3D_torch_fast(
     
     return vertices, faces, index_map
 
+@torch.no_grad()
 def postprocess3D(
     prediction: torch.Tensor,  # (B, D, H, W, 6)
     mag: float,

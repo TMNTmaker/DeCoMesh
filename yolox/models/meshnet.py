@@ -1,8 +1,9 @@
 import torch
-from torch.nn import Conv2d, Module, ReLU, MaxPool2d, init
-from typing import Tuple
+import torch.nn as nn
+from yolox.models.losses import *
+
 import time
-class MeshNet(Module):
+class MeshNet(nn.Module):
     def __init__(self):
         super().__init__()
         
@@ -13,8 +14,8 @@ class MeshNet(Module):
         #self.stage_5 = Stage_x()
         #self.stage_6 = Stage_x()
         for m in self.modules():
-            if isinstance(m, Conv2d):
-                init.constant_(m.bias, 0)
+            if isinstance(m, nn.Conv2d):
+                nn.init.constant_(m.bias, 0)
         
     def forward(self, x,labels=None,reduction_mag=None):
         pafs = []
@@ -194,45 +195,44 @@ class MeshNet(Module):
                 p3 = patch[3, y0:y1, x0:x1]; m3 = (p3 == 0)
                 p3[m3] = to_tgt_x[m3]
 
-        with torch.inference_mode():
-            # 面が全ゼロのものを除外
-            valid_mask = jl.abs().sum(dim=(3, 4)) > 0  # [B,N,F]
+        # 面が全ゼロのものを除外
+        valid_mask = jl.abs().sum(dim=(3, 4)) > 0  # [B,N,F]
 
-            for b in range(B):
-                if not valid_mask[b].any():
-                    continue
+        for b in range(B):
+            if not valid_mask[b].any():
+                continue
 
-                faces_b = jl[b][valid_mask[b]]        # [M,4,3]
-                if faces_b.numel() == 0:
-                    continue
+            faces_b = jl[b][valid_mask[b]]        # [M,4,3]
+            if faces_b.numel() == 0:
+                continue
 
-                # 4 頂点から4エッジ (i-1 -> i) をベクトル化で生成
-                A3 = torch.roll(faces_b, shifts=1, dims=1).reshape(-1, 3)  # [M*4,3]
-                B3 = faces_b.reshape(-1, 3)                                # [M*4,3]
+            # 4 頂点から4エッジ (i-1 -> i) をベクトル化で生成
+            A3 = torch.roll(faces_b, shifts=1, dims=1).reshape(-1, 3)  # [M*4,3]
+            B3 = faces_b.reshape(-1, 3)                                # [M*4,3]
 
-                # --- view ごとに 2D 座標を作って一括でエッジ描画 ---
-                # xy
-                A2_xy = (A3[:, [0, 1]] / r).contiguous()
-                B2_xy = (B3[:, [0, 1]] / r).contiguous()
-                draw_edges_view(pafs[b, 0:4], A2_xy, B2_xy)
+            # --- view ごとに 2D 座標を作って一括でエッジ描画 ---
+            # xy
+            A2_xy = (A3[:, [0, 1]] / r).contiguous()
+            B2_xy = (B3[:, [0, 1]] / r).contiguous()
+            draw_edges_view(pafs[b, 0:4], A2_xy, B2_xy)
 
-                # yz
-                A2_yz = (A3[:, [1, 2]] / r).contiguous()
-                B2_yz = (B3[:, [1, 2]] / r).contiguous()
-                draw_edges_view(pafs[b, 4:8], A2_yz, B2_yz)
+            # yz
+            A2_yz = (A3[:, [1, 2]] / r).contiguous()
+            B2_yz = (B3[:, [1, 2]] / r).contiguous()
+            draw_edges_view(pafs[b, 4:8], A2_yz, B2_yz)
 
-                # zx
-                A2_zx = (A3[:, [2, 0]] / r).contiguous()
-                B2_zx = (B3[:, [2, 0]] / r).contiguous()
-                draw_edges_view(pafs[b, 8:12], A2_zx, B2_zx)
+            # zx
+            A2_zx = (A3[:, [2, 0]] / r).contiguous()
+            B2_zx = (B3[:, [2, 0]] / r).contiguous()
+            draw_edges_view(pafs[b, 8:12], A2_zx, B2_zx)
 
-            # --- ignore mask を作成（ch 合計が 0 の画素を ignore=1）---
-            block_xy = pafs[:, 0:4].sum(dim=1).abs()
-            block_yz = pafs[:, 4:8].sum(dim=1).abs()
-            block_zx = pafs[:, 8:12].sum(dim=1).abs()
-            ignore_mask = torch.stack([(block_xy < 1e-5),
-                                    (block_yz < 1e-5),
-                                    (block_zx < 1e-5)], dim=1).to(torch.uint8)
+        # --- ignore mask を作成（ch 合計が 0 の画素を ignore=1）---
+        block_xy = pafs[:, 0:4].sum(dim=1).abs()
+        block_yz = pafs[:, 4:8].sum(dim=1).abs()
+        block_zx = pafs[:, 8:12].sum(dim=1).abs()
+        ignore_mask = torch.stack([(block_xy > 1e-5),
+                                (block_yz > 1e-5),
+                                (block_zx > 1e-5)], dim=1).to(torch.uint8)
 
         if out_dtype is None:
             out_dtype = x.dtype
@@ -246,101 +246,62 @@ class MeshNet(Module):
                      ignore_mask,
                      lambda_offset=10.0,
                      lambda_target=10.0):
-
-        def mean_square_error(pred, target):
-            assert pred.shape == target.shape, 'x and y should in same shape'
-            return torch.sum((pred - target) ** 2) / target.nelement()
-
         
         loss_total = 0
         torch.cuda.synchronize(); t0 = time.time()
         
         # compute loss on each stage
         
-        #pafs_off_t = torch.stack((
-        #        pafs_t[:, 0],
-        #        pafs_t[:, 1],
-        #        pafs_t[:, 4],
-        #        pafs_t[:, 5],
-        #        pafs_t[:, 8],
-        #        pafs_t[:, 9],
-        #    ), dim=1)
-        #pafs_tgt_t = torch.stack((
-        #        pafs_t[:, 2],
-        #        pafs_t[:, 3],
-        #        pafs_t[:, 6],
-        #        pafs_t[:, 7],
-        #        pafs_t[:, 10],
-        #        pafs_t[:, 11],
-        #    ), dim=1)
-                
         for pafs_y in pafs_ys:
-            #with torch.no_grad():
-            #    stage_pafs_t = pafs_t.clone()
-            #    stage_paf_masks = ignore_mask.clone()
-            #    mask_expanded = stage_paf_masks.repeat_interleave(4, dim=1)
-            #    stage_pafs_t = stage_pafs_t.to(device=pafs_y.device, dtype=pafs_y.dtype)        
-            #    stage_pafs_t[mask_expanded == 1] = pafs_y.detach()[mask_expanded == 1]
-
-            #pafs_off_y = torch.stack((
-            #    pafs_y[:, 0],
-            #    pafs_y[:, 1],
-            #    pafs_y[:, 4],
-            #    pafs_y[:, 5],
-            #    pafs_y[:, 8],
-            #    pafs_y[:, 9],
-            #), dim=1)
+           
+           
+            loss_offset = lambda_offset*mean_square_error(pafs_y[:, [0,1,4,5,8,9]], 
+                                                        pafs_t[:, [0,1,4,5,8,9]])                      
+            loss_target = lambda_target*mean_square_error(pafs_y[:, [2,3,6,7,10,11]], 
+                                                        pafs_t[:, [2,3,6,7,10,11]])                      
+            #loss_offset_xy = lambda_offset*masked_mse_loss(pafs_y[:, [0,1]], 
+            #                                            pafs_t[:, [0,1]],
+            #                                            ignore_mask[:,0])           
+            #loss_offset_yz = lambda_offset*masked_mse_loss(pafs_y[:, [4,5]], 
+            #                                            pafs_t[:, [4,5]],
+            #                                            ignore_mask[:,1])           
+            #loss_offset_zx = lambda_offset*masked_mse_loss(pafs_y[:, [8,9]], 
+            #                                            pafs_t[:, [8,9]],
+            #                                            ignore_mask[:,2])           
             #
-            #pafs_tgt_y = torch.stack((
-            #    pafs_y[:, 2],
-            #    pafs_y[:, 3],
-            #    pafs_y[:, 6],
-            #    pafs_y[:, 7],
-            #    pafs_y[:, 10],
-            #    pafs_y[:, 11],
-            #), dim=1)
-           
-           
-           
-            loss_offset = lambda_offset*mean_square_error(pafs_y[:, [0,1,4,5,8,9]], pafs_t[:, [0,1,4,5,8,9]])           
-            loss_target = lambda_target*mean_square_error(pafs_y[:, [2,3,6,7,10,11]],pafs_t[:, [2,3,6,7,10,11]])
+            #loss_target_xy = lambda_target*masked_mse_loss(pafs_y[:, [2,3]],
+            #                                            pafs_t[:, [2,3]],
+            #                                            ignore_mask[:,0])
+            #loss_target_yz = lambda_target*masked_mse_loss(pafs_y[:, [6,7]],
+            #                                            pafs_t[:, [6,7]],
+            #                                            ignore_mask[:,1])
+            #loss_target_zx = lambda_target*masked_mse_loss(pafs_y[:, [10,11]],
+            #                                            pafs_t[:, [10,11]],
+            #                                            ignore_mask[:,2])
+            #
+            #loss_offset = loss_offset_xy + loss_offset_yz + loss_offset_zx 
+            #loss_target = loss_target_xy + loss_target_yz + loss_target_zx 
+        
             loss_total += loss_offset + loss_target
         torch.cuda.synchronize(); t1 = time.time()
         print(f"mesh loss processing time: {t1-t0:.4f}s")
         return loss_total, loss_offset,loss_target
 
 
-"""
-# ...existing code...
-def masked_mse(pred, target, mask):
-    # pred/target: [B,12,H,W], mask: [B,3,H,W] (1 = ignore)
-    mask_exp = mask.repeat_interleave(4, dim=1).bool()  # -> [B,12,H,W]
-    valid = ~mask_exp
-    if valid.sum() == 0:
-        return torch.tensor(0., device=pred.device, dtype=pred.dtype)
-    diff = (pred - target) ** 2
-    return diff[valid].mean()
-
-# ...inside loss_all loop...
-for pafs_y in pafs_ys:
-    # 直接マスク付き損失を計算
-    loss_offset = lambda_offset * masked_mse(pafs_y[:, [0,1,4,5,8,9]], pafs_off_t, ignore_mask)
-    loss_target = lambda_target * masked_mse(pafs_y[:, [2,3,6,7,10,11]], pafs_tgt_t, ignore_mask)
-    loss_total += loss_offset + loss_target
-# ...existing code..."""
-
-
 
  
-class Stage_1(Module):
+class Stage_1(nn.Module):
     def __init__(self):
         super(Stage_1, self).__init__()
-        self.conv1_CPM_L1 = Conv2d(in_channels=256, out_channels=128, kernel_size=3, stride=1, padding=1)
-        #self.conv2_CPM_L1 = Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
-        #self.conv3_CPM_L1 = Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
-        self.conv4_CPM_L1 = Conv2d(in_channels=128, out_channels=256, kernel_size=1, stride=1, padding=0)
-        self.conv5_CPM_L1 = Conv2d(in_channels=256, out_channels=12, kernel_size=1, stride=1, padding=0)
-        self.relu = ReLU()
+        self.conv1_CPM_L1 = nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, stride=1, padding=1)
+        #self.conv2_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
+        #self.conv3_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
+        self.conv4_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=1, stride=1, padding=0)
+        self.conv5_CPM_L1 = nn.Conv2d(in_channels=256, out_channels=12, kernel_size=1, stride=1, padding=0)
+        self.relu = nn.ReLU()
+        self.bn   = nn.BatchNorm2d(num_features=12)
+        self.softsign = nn.Softsign()
+        
         
     def forward(self, x):
         h1 = self.relu(self.conv1_CPM_L1(x)) # branch1
@@ -348,19 +309,22 @@ class Stage_1(Module):
         #h1 = self.relu(self.conv3_CPM_L1(h1))
         h1 = self.relu(self.conv4_CPM_L1(h1))
         h1 = self.conv5_CPM_L1(h1)
+        h1 = torch.tanh(self.bn(h1))
         return h1
     
-class Stage_x(Module):
+class Stage_x(nn.Module):
     def __init__(self):
         super(Stage_x, self).__init__()
-        self.conv1_L1 = Conv2d(in_channels = 268, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        #self.conv2_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        #self.conv3_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        #self.conv4_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        #self.conv5_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        self.conv6_L1 = Conv2d(in_channels = 128, out_channels = 128, kernel_size = 1, stride = 1, padding = 0)
-        self.conv7_L1 = Conv2d(in_channels = 128, out_channels = 12, kernel_size = 1, stride = 1, padding = 0)
-        self.relu = ReLU()
+        self.conv1_L1 = nn.Conv2d(in_channels = 268, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        #self.conv2_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        #self.conv3_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        #self.conv4_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        #self.conv5_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        self.conv6_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 1, stride = 1, padding = 0)
+        self.conv7_L1 = nn.Conv2d(in_channels = 128, out_channels = 12, kernel_size = 1, stride = 1, padding = 0)
+        self.relu = nn.ReLU()
+        self.bn   = nn.BatchNorm2d(num_features=12)
+        self.softsign = nn.Softsign()
         
     def forward(self, x):
         h1 = self.relu(self.conv1_L1(x)) # branch1
@@ -370,4 +334,5 @@ class Stage_x(Module):
         #h1 = self.relu(self.conv5_L1(h1))
         h1 = self.relu(self.conv6_L1(h1))
         h1 = self.conv7_L1(h1)
+        h1 = torch.tanh(self.bn(h1))
         return h1
