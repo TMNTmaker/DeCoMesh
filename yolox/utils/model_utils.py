@@ -14,7 +14,9 @@ __all__ = [
     "fuse_model",
     "get_model_info",
     "replace_module",
+    "freeze_module_unit",
     "freeze_module",
+    "unfreeze_module",
     "adjust_status",
 ]
 
@@ -128,7 +130,26 @@ def replace_module(module, replaced_module_type, new_module_type, replace_func=N
     return model
 
 
-def freeze_module(module: nn.Module, name=None) -> nn.Module:
+
+
+def freeze_module(m: nn.Module, set_eval: bool = True):
+    for p in m.parameters():
+        p.requires_grad = False
+    if set_eval:
+        m.eval()
+
+def unfreeze_module(m: nn.Module, set_train: bool = True):
+    for p in m.parameters():
+        p.requires_grad = True
+    if set_train:
+        m.train()
+
+#def build_optimizer(model: nn.Module, lr=1e-3, wd=1e-2):
+#    params = [p for p in model.parameters() if p.requires_grad]
+#    return torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+
+
+def freeze_module_unit(module: nn.Module, name=None) -> nn.Module:
     """freeze module inplace
 
     Args:

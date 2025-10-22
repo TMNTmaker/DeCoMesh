@@ -70,7 +70,7 @@ class Exp(BaseExp):
 
         # ---------------- model config ---------------- #
         # detect classes number of model
-        self.num_classes = 38#18
+        self.num_classes = len(SUNRGBD_CLASSES_20)
         # factor of model depth
         self.depth = 1.00
         # factor of model width
@@ -121,7 +121,7 @@ class Exp(BaseExp):
         # epoch number used for warmup
         self.warmup_epochs = 5
         # max training epoch
-        self.max_epoch = 300
+        self.max_epoch = 30#300
         # minimum learning rate during warmup
         self.warmup_lr = 0
         self.min_lr_ratio = 0.05
@@ -143,7 +143,7 @@ class Exp(BaseExp):
         self.print_interval = 10
         # eval period in epoch, for example,
         # if set to 1, model will be evaluate after every epoch.
-        self.eval_interval = 1
+        self.eval_interval = 5
         # save history checkpoint or not.
         # If set to False, yolox will only save latest and best ckpt.
         self.save_history_ckpt = True
@@ -313,29 +313,31 @@ class Exp(BaseExp):
             targets["mesh"][..., 2] = targets["mesh"][..., 2] * scale_x
         return inputs, targets
 
-    def get_optimizer(self, batch_size):
-        if "optimizer" not in self.__dict__:
+    def get_optimizer(self, batch_size, force_rebuild: bool = False):
+        need_build = force_rebuild or ("optimizer" not in self.__dict__)
+        if need_build:
             if self.warmup_epochs > 0:
                 lr = self.warmup_lr
             else:
                 lr = self.basic_lr_per_img * batch_size
 
-            pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
+            pg0, pg1, pg2 = [], [], []  # no decay (BN), with decay (weights), biases
 
+            # ★ named_modules()から拾う方式はそのままでもOKだが、BNは全種類を判定する
+            import torch.nn as nn
             for k, v in self.model.named_modules():
+                # bias
                 if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter):
-                    pg2.append(v.bias)  # biases
-                if isinstance(v, nn.BatchNorm2d) or "bn" in k:
-                    pg0.append(v.weight)  # no decay
+                    pg2.append(v.bias)
+                # weights
+                if isinstance(v, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)) or ("bn" in k):
+                    if hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
+                        pg0.append(v.weight)  # no decay
                 elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
-                    pg1.append(v.weight)  # apply decay
+                    pg1.append(v.weight)  # decay
 
-            optimizer = torch.optim.SGD(
-                pg0, lr=lr, momentum=self.momentum, nesterov=True
-            )
-            optimizer.add_param_group(
-                {"params": pg1, "weight_decay": self.weight_decay}
-            )  # add pg1 with weight_decay
+            optimizer = torch.optim.SGD(pg0, lr=lr, momentum=self.momentum, nesterov=True)
+            optimizer.add_param_group({"params": pg1, "weight_decay": self.weight_decay})
             optimizer.add_param_group({"params": pg2})
             self.optimizer = optimizer
 

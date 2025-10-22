@@ -56,7 +56,7 @@ def masked_mse(pred, target, mask):
     diff = (pred - target) ** 2
     return diff[valid].mean()
 
-def masked_mse_loss(pred, target, mask, eps=1e-12):
+def masked_mse_loss(pred, target, mask, eps=1e-12, anchor=None):
     # 1) 計算は少なくとも fp32 で
     pred   = pred.float()
     target = target.float()
@@ -65,25 +65,21 @@ def masked_mse_loss(pred, target, mask, eps=1e-12):
         mask = mask.unsqueeze(1).expand_as(pred) 
     else: 
         mask = mask.expand_as(pred)
-    # 2) マスクは bool（>0 を有効）に正規化
-    if mask.dtype is torch.bool:
-        m = mask
-    else:
-        m = mask > 0
-
+    
+    
+    m=mask
     # 3) 入力の有限性チェックで汚染を遮断
     m = m & torch.isfinite(pred) & torch.isfinite(target)
 
-    valid = m.sum(dtype=torch.float32)
-    if valid == 0:
-        # 有効画素ゼロなら勾配0のスカラーを返す
-        return pred.new_zeros(())
-
-    # 4) “有効な要素だけ” を平均（sum/valid は fp32）
-    diff = (pred - target)**2
-    num  = diff.masked_select(m).sum(dtype=torch.float32)
-    den  = valid  # clamp_min(1) ではなく、valid==0 の分岐で対処済み
-    return num / (den + eps)
+    m = m.to(dtype=pred.dtype)
+    
+    diff2 = (pred - target) ** 2
+    num = (diff2 * m).sum()
+    den = m.sum().clamp_min(1)
+    loss = num / den
+    if anchor is not None and not loss.requires_grad:
+        loss = loss + 0.0 * anchor.sum()
+    return loss
 
 
 

@@ -7,7 +7,7 @@ import unittest
 import torch
 from torch import nn
 
-from yolox.utils import adjust_status, freeze_module
+from yolox.utils import adjust_status, freeze_module_unit
 from yolox.exp import get_exp
 
 
@@ -79,7 +79,7 @@ class TestModelUtils(unittest.TestCase):
         model.train()
         assert isinstance(model[1], nn.BatchNorm2d)
         before_states = model[1].state_dict()
-        freeze_module(model[1])
+        freeze_module_unit(model[1])
         model(data)
         after_states = model[1].state_dict()
         self.assertTrue(
@@ -91,7 +91,7 @@ class TestModelUtils(unittest.TestCase):
         for module in self.model.modules():
             self.assertTrue(module.training)
 
-        freeze_module(self.model, "backbone")
+        freeze_module_unit(self.model, "backbone")
         for module in self.model.backbone.modules():
             self.assertFalse(module.training)
         for p in self.model.backbone.parameters():

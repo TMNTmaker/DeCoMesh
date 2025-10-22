@@ -17,7 +17,7 @@ from yolox.utils import (
     MlflowLogger,
     ModelEMA,
     WandbLogger,
-    freeze_module,
+    freeze_module_unit,
     adjust_status,
     all_reduce_norm,
     get_local_rank,
@@ -135,10 +135,25 @@ class Trainer:
 
         loss = outputs["total_loss"]
 
-        self.optimizer.zero_grad()
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        # ====== AMP-safe step ======
+        self.optimizer.zero_grad(set_to_none=True)
+
+        did_step = False
+        if self._optimizer_has_params():
+            # 勾配を立てる（学習対象がある時だけ）
+            self.scaler.scale(loss).backward()
+
+            # 勾配が1つでも存在する時だけ step
+            if self._optimizer_has_any_grad():
+                self.scaler.step(self.optimizer)
+                did_step = True
+            else:
+                # 何も勾配が無いケースはstepしない（updateも呼ばない）
+                pass
+
+        # stepした時だけ update する（←ここが重要）
+        if did_step:
+            self.scaler.update()
 
         if self.use_model_ema:
             self.ema_model.update(self.model)
@@ -154,7 +169,31 @@ class Trainer:
             lr=lr,
             **outputs,
         )
+        
+        
+    def _optimizer_has_params(self) -> bool:
+        return any(len(g.get("params", [])) > 0 for g in self.optimizer.param_groups)
 
+    def _optimizer_has_any_grad(self) -> bool:
+        for g in self.optimizer.param_groups:
+            for p in g.get("params", []):
+                if p.grad is not None:
+                    return True
+        return False
+    def _filter_optimizer_params(self):
+        """凍結後に optimizer から凍結済みパラメータを外す。"""
+        new_groups = []
+        for group in self.optimizer.param_groups:
+            params = [p for p in group["params"] if p.requires_grad]
+            if len(params) == 0:
+                continue
+            g = dict(group)  # shallow copy
+            g["params"] = params
+            new_groups.append(g)
+        # すべて外れてしまった場合は警告＆そのまま（学習は起きない）
+        if len(new_groups) > 0:
+            self.optimizer.param_groups[:] = new_groups
+            
     def before_train(self):
         logger.info("args: {}".format(self.args))
         logger.info("exp value:\n{}".format(self.exp))
@@ -200,7 +239,55 @@ class Trainer:
             self.ema_model.updates = self.max_iter * self.start_epoch
 
         self.model = model
+        
+        total = self.max_epoch
+        if not hasattr(self.exp, "stage_epochs"):
+            e1 = max(1, total // 3)
+            e2 = max(1, (total - e1) // 2)
+            e3 = max(1, total - e1 - e2)
+            self.exp.stage_epochs = (e1, e2, e3)
+        self._stage_boundaries = (
+            self.exp.stage_epochs[0],
+            self.exp.stage_epochs[0] + self.exp.stage_epochs[1],
+            total,
+        )
 
+        # 初期ステージ設定（再開時も現在epochに応じて設定）
+        def _set_stage_for_epoch(curr_epoch: int):
+            b1, b2, _ = self._stage_boundaries
+            stage = 1 if curr_epoch < b1 else (2 if curr_epoch < b2 else 3)
+            mm = self.model.module if is_parallel(self.model) else self.model
+            mm.set_stage(stage)
+
+            # ★ ステージに合わせて Optimizer を強制再構築
+            self.optimizer = self.exp.get_optimizer(self.args.batch_size, force_rebuild=True)
+
+            # optimizer から凍結パラメータを除外
+            self._filter_optimizer_params()
+            
+            # デバッグ出力
+            def _cnt_trainable(mod): return sum(p.requires_grad for p in mod.parameters())
+            cnts = {
+                "backbone": _cnt_trainable(mm.backbone),
+                "classnet": _cnt_trainable(mm.classnet),
+                "meshnet":  _cnt_trainable(mm.meshnet),
+                "coord3d":  _cnt_trainable(mm.coordinate3d),
+            }
+            opt_nparams = sum(len(g["params"]) for g in self.optimizer.param_groups)
+            logger.info(f"[Stage={stage}] trainable={cnts}, optimizer_params={opt_nparams}")
+            if opt_nparams == 0:
+                logger.warning(f"[Stage {stage}] optimizer has no trainable params; skipping step this stage.")
+            
+            
+            if not self._optimizer_has_params():
+                logger.warning(f"[Stage {stage}] No trainable parameters in optimizer "
+                            f"(all modules frozen?). Backprop will run but no step will be taken.")
+            logger.info(f"[Stage] epoch={curr_epoch+1} -> stage={stage}  "
+                        f"(boundaries: {self._stage_boundaries})")
+
+        _set_stage_for_epoch(self.start_epoch)
+        self._set_stage_for_epoch = _set_stage_for_epoch         
+        
         self.evaluator = self.exp.get_evaluator(
             batch_size=self.args.batch_size, is_distributed=self.is_distributed
         )
@@ -243,21 +330,21 @@ class Trainer:
 
     def before_epoch(self):
         logger.info("---> start train epoch{}".format(self.epoch + 1))
-        
+        self._set_stage_for_epoch(self.epoch)
         ##FOR DEBUG
         #self.evaluate_and_save_model()
         ##
         if self.epoch + 1 == self.max_epoch - self.exp.no_aug_epochs or self.no_aug:
             logger.info("--->No mosaic aug now!")
             self.train_loader.close_mosaic()
-            logger.info("--->Add additional L1 loss now!")
-            if self.is_distributed:
-                self.model.module.head.use_l1 = True
-            else:
-                self.model.head.use_l1 = True
-            self.exp.eval_interval = 1
-            if not self.no_aug:
-                self.save_ckpt(ckpt_name="last_mosaic_epoch")
+            #logger.info("--->Add additional L1 loss now!")
+            #if self.is_distributed:
+            #    self.model.module.head.use_l1 = True
+            #else:
+            #    self.model.head.use_l1 = True
+            #self.exp.eval_interval = 1
+            #if not self.no_aug:
+            #    self.save_ckpt(ckpt_name="last_mosaic_epoch")
 
     def after_epoch(self):
         self.save_ckpt(ckpt_name="latest")
@@ -370,7 +457,7 @@ class Trainer:
                 ckpt = torch.load(ckpt_file, map_location=self.device)["model"]
                 model = load_ckpt(model, ckpt)
                 if self.args.freeze:
-                    freeze_module(model, "backbone")
+                    freeze_module_unit(model, "backbone")
             self.start_epoch = 0
 
         return model
