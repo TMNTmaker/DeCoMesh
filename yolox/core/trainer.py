@@ -33,6 +33,53 @@ from yolox.utils import (
     setup_logger,
     synchronize
 )
+#torch.autograd.set_detect_anomaly(True)
+
+
+def add_nan_hooks(model, *, name_prefix=""):
+    """
+    前向き/後ろ向きで NaN/Inf を検知した瞬間に RuntimeError を投げるフック。
+    戻り値: handles（後で remove() して解除できる）
+    """
+    import torch
+    handles = []
+
+    def is_bad(t):
+        return torch.is_tensor(t) and (torch.isnan(t).any() or torch.isinf(t).any())
+
+    def make_fwd_hook(name):
+        def hook(mod, inp, out):
+            ins  = inp if isinstance(inp, (list, tuple)) else (inp,)
+            outs = out if isinstance(out, (list, tuple)) else (out,)
+            if any(is_bad(t) for t in ins) or any(is_bad(t) for t in outs):
+                logger.error(f"[NaNHook-FWD] {name} produced/received NaN/Inf")
+        return hook
+
+    def make_bwd_hook(name):
+        # full_backward_hook は (module, grad_input, grad_output)
+        def hook(mod, gin, gout):
+            ins  = gin if isinstance(gin, (list, tuple)) else (gin,)
+            outs = gout if isinstance(gout, (list, tuple)) else (gout,)
+            if any(is_bad(t) for t in ins if t is not None) or any(is_bad(t) for t in outs if t is not None):
+                logger.error(f"[NaNHook-BWD] {name} grad has NaN/Inf")
+        return hook
+
+
+    for n, m in model.named_modules():
+        name = f"{name_prefix}{n}" if name_prefix else n
+        handles.append(m.register_forward_hook(make_fwd_hook(name)))
+        # 後方も見る（PyTorch>=1.8）
+        handles.append(m.register_full_backward_hook(make_bwd_hook(name)))
+
+    return handles
+
+def remove_hooks(handles):
+    for h in handles:
+        try:
+            h.remove()
+        except Exception:
+            pass
+
 
 
 class Trainer:
@@ -135,27 +182,66 @@ class Trainer:
 
         loss = outputs["total_loss"]
 
+        
+         # --- 非有限 loss はこの時点で捨てる（unscale_ をまだ呼ばないので update も不要） ---
+        if not torch.isfinite(loss):
+            # どこで壊れてるか最低限のログ
+            bad = {n: torch.isnan(v).any().item() or torch.isinf(v).any().item()
+                for n, v in outputs.items() if torch.is_tensor(v)}
+            logger.error(f"[NaN] non-finite loss detected; per-output flags={bad}")
+            self.optimizer.zero_grad(set_to_none=True)# このイテレーションは捨てる（重みを更新しない）
+            return 
         # ====== AMP-safe step ======
         self.optimizer.zero_grad(set_to_none=True)
 
-        did_step = False
-        if self._optimizer_has_params():
-            # 勾配を立てる（学習対象がある時だけ）
+        # 学習対象が無ければ何もしない（unscale_ も呼ばない）
+        if not self._optimizer_has_params():
+            pass
+        else: 
+            # 勾配作成
             self.scaler.scale(loss).backward()
 
-            # 勾配が1つでも存在する時だけ step
-            if self._optimizer_has_any_grad():
-                self.scaler.step(self.optimizer)
-                did_step = True
-            else:
-                # 何も勾配が無いケースはstepしない（updateも呼ばない）
-                pass
+            # すべての param.grad が None のときはこのイテレーションはスキップ
+            any_grad = False
+            for g in self.optimizer.param_groups:
+                for p in g["params"]:
+                    if p.grad is not None:
+                        any_grad = True
+                        break
+                if any_grad: break
+            if not any_grad:
+                # unscale_ をまだ呼んでいないので update も不要
+                return
 
-        # stepした時だけ update する（←ここが重要）
-        if did_step:
+            # --- ここで初めて unscale_（以降は必ず update() を呼ぶ） ---
+            self.scaler.unscale_(self.optimizer)
+
+            # 非有限勾配ガード（見つかったら 0化でも良いが、まずはスキップ推奨）
+            bad_grad = False
+            for g in self.optimizer.param_groups:
+                for p in g["params"]:
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        bad_grad = True
+                        break
+                if bad_grad: break
+
+            if bad_grad:
+                logger.error("[GradNaN] non-finite gradient detected; skip this iter")
+                self.optimizer.zero_grad(set_to_none=True)
+                # ★ unscale_ 済みなので必ず update() を呼んで状態をリセット
+                self.scaler.update()
+                return
+
+            # 勾配クリップ（必要なら）
+            torch.nn.utils.clip_grad_norm_(
+                [p for g in self.optimizer.param_groups for p in g["params"] if p.grad is not None],
+                max_norm=5.0
+            )
+
+            # 1回だけ step → 1回だけ update
+            self.scaler.step(self.optimizer)
             self.scaler.update()
-
-        if self.use_model_ema:
+        if self.use_model_ema and torch.isfinite(loss):
             self.ema_model.update(self.model)
 
         lr = self.lr_scheduler.update_lr(self.progress_in_iter + 1)
@@ -242,8 +328,8 @@ class Trainer:
         
         total = self.max_epoch
         if not hasattr(self.exp, "stage_epochs"):
-            e1 = max(1, total // 3)
-            e2 = max(1, (total - e1) // 2)
+            e1 = 0#max(1, total // 3)
+            e2 = 0#max(1, (total - e1) // 2)
             e3 = max(1, total - e1 - e2)
             self.exp.stage_epochs = (e1, e2, e3)
         self._stage_boundaries = (
@@ -264,7 +350,9 @@ class Trainer:
 
             # optimizer から凍結パラメータを除外
             self._filter_optimizer_params()
-            
+            self._nan_hooks = []
+            #self._nan_hooks += add_nan_hooks(mm.meshnet,      name_prefix="meshnet.")
+            self._nan_hooks += add_nan_hooks(mm.coordinate3d, name_prefix="coord3d.")
             # デバッグ出力
             def _cnt_trainable(mod): return sum(p.requires_grad for p in mod.parameters())
             cnts = {
@@ -311,6 +399,9 @@ class Trainer:
         logger.info("\n{}".format(model))
 
     def after_train(self):
+        if hasattr(self, "_nan_hooks"):
+            remove_hooks(self._nan_hooks)
+        
         logger.info(
             "Training of experiment is done and the best AP is {:.2f}".format(self.best_ap * 100)
         )

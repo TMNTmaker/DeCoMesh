@@ -412,7 +412,7 @@ def cluster_vectors3D_torch(
 import math
 import torch
 
-@torch.no_grad()
+#@torch.no_grad()
 def cluster_vectors3D_torch_fast(
     vector_field: torch.Tensor,
     mag: float,
@@ -490,7 +490,7 @@ def cluster_vectors3D_torch_fast(
     step_speed = (T*m0)
     # m0 / (torch.linalg.norm(m0, dim=1, keepdim=True) + step_eps)  # (K,3) float
     #単位ベクトル化
-    norms = torch.linalg.norm(step_speed, dim=1, keepdim=True) + step_eps
+    norms = torch.linalg.norm(step_speed, dim=1, keepdim=True).clamp_min(step_eps)
     step_unit = step_speed / norms
     # 現在離散座標（+/-）
     cz_p = z0.clone()
@@ -823,7 +823,7 @@ def cluster_vectors3D_torch_fast(
     
     return vertices, faces, index_map
 
-@torch.no_grad()
+#@torch.no_grad()
 def postprocess3D(
     prediction: torch.Tensor,  # (B, D, H, W, 6)
     mag: float,

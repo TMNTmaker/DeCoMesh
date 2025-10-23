@@ -81,7 +81,8 @@ class LowRankVoxelFusion(nn.Module):
             nn.BatchNorm2d(self.out_channels),
             #nn.Flatten(2, 3)
         )
-        self.bn3d = nn.BatchNorm3d(num_features=6)
+        self.norm3d = nn.GroupNorm(num_groups=2, num_channels=6, eps=1e-5, affine=True)
+
         self.softsign = nn.Softsign()
     def forward(self, front,side,top):
         front = self.decoder_front(front)
@@ -95,8 +96,19 @@ class LowRankVoxelFusion(nn.Module):
             side.view(-1, 6, self.out_channels//6, W, Z),
             top.view(-1, 6, self.out_channels//6, Z, H),
         ) / (self.out_channels/6)
-         
-        voxel_bn = self.bn3d(voxel)
+        
+        
+        from torch.cuda.amp import autocast
+
+        # voxel: [B, C, D, H, W]
+        voxel = torch.nan_to_num(voxel, nan=0.0, posinf=1e4, neginf=-1e4)
+        voxel = voxel.clamp(-1e4, 1e4)
+
+        # BNは確実にfp32で
+        with autocast(enabled=False):
+            
+            y = self.norm3d(voxel.float())
+        voxel_bn = y.to(voxel.dtype)
         
         return  self.softsign(voxel_bn)#torch.tanh(voxel_bn)
 
@@ -259,23 +271,6 @@ class TriView2CoordGrid(nn.Module):
                 Hy = A3[1] + t * vy
                 Hz = A3[2] + t * vz
 
-                # セル中心→線分の距離
-                #dist = torch.sqrt((Xc - Hx)**2 + (Yc - Hy)**2 + (Zc - Hz)**2)
-
-                # 3×3×3のしきい値を位置オフセットで引く
-                #dx_off = torch.clamp(torch.floor(Hx - Xc - 0.5), -1, 1).to(torch.long)  # ∈{-1,0,1}
-                #dy_off = torch.clamp(torch.floor(Hy - Yc - 0.5), -1, 1).to(torch.long)
-                #dz_off = torch.clamp(torch.floor(Hz - Zc - 0.5), -1, 1).to(torch.long)
-                #ix = dx_off + 1
-                #iy = dy_off + 1
-                #iz = dz_off + 1
-                #th_local = th_kernel[iz, iy, ix]  # (dz,dy,dx)
-
-                ## ドロー対象
-                #draw = dist <= th_local
-                #if not bool(draw.any().item()):
-                #    continue
-
                 # A/B への相対オフセット（最近の始点側を採用）
                 off_xa = A3[0] - Xc; off_ya = A3[1] - Yc; off_za = A3[2] - Zc
                 off_xb = B3[0] - Xc; off_yb = B3[1] - Yc; off_zb = B3[2] - Zc
@@ -309,10 +304,6 @@ class TriView2CoordGrid(nn.Module):
                 tgt_x = torch.where(use_B2, BCx, ACx)
                 tgt_y = torch.where(use_B2, BCy, ACy)
                 tgt_z = torch.where(use_B2, BCz, ACz)
-                #tgt_norm = torch.sqrt(tgt_x*tgt_x + tgt_y*tgt_y + tgt_z*tgt_z + 1e-12)
-                #tgt_x = tgt_x / tgt_norm
-                #tgt_y = tgt_y / tgt_norm
-                #tgt_z = tgt_z / tgt_norm
                 ms = int(math.ceil(math.sqrt(D*D + H*H + W*W)))
                     # 両方向なので片側あたり T = ceil(ms/2)
                 T = max(1, (ms + 1)//2)
@@ -370,8 +361,10 @@ class TriView2CoordGrid(nn.Module):
                     groundpolygon, 
                     predictpolygon,
                     ignore_mask,
-                    lambda_offset=500.0,
-                    lambda_target=500.0,
+                    lambda_offset=10.0,
+                    lambda_target=10.0,
+                    lambda_chamfer=1.0,
+                    lambda_3dIoU=5.0
                     ):
         torch.cuda.synchronize(); t2 = time.time()
         loss_chamfer = chamfer_distance(predictpolygon, groundpolygon)
@@ -385,7 +378,8 @@ class TriView2CoordGrid(nn.Module):
         loss_target = lambda_target*masked_mse_loss(vector_field_y[:, [3,4,5]], 
                                                     vector_field_t[:, [3,4,5]],
                                                     ignore_mask)
-        loss_total = loss_offset + loss_target  #+ loss_IoU3D
+        loss_total = loss_offset + loss_target  +\
+        lambda_chamfer*torch.log(loss_chamfer) + lambda_3dIoU*loss_IoU3D
 
         return loss_total,loss_offset,loss_target,loss_chamfer, loss_IoU3D
 

@@ -85,7 +85,7 @@ def masked_mse_loss(pred, target, mask, eps=1e-12, anchor=None):
 
 TensorLike = Union[torch.Tensor, List, torch.Tensor]
 
-@torch.no_grad()
+#@torch.no_grad()
 def chamfer_distance(
     predict: List[List[TensorLike]],
     ground:  List[List[TensorLike]],
@@ -193,7 +193,7 @@ def chamfer_distance(
 import torch
 from typing import List, Tuple, Sequence
 
-@torch.no_grad()
+#@torch.no_grad()
 def IoU3D_voxel(
     predict: List[List[TensorLike]],
     ground:  List[List[TensorLike]],
