@@ -22,9 +22,9 @@ class YOLOx3D(nn.Module):
         学習に使わずにモニタ用の値だけ計算（勾配なし）。
         """
         loss_class_m, _ = self.classnet(fpn0, targets["category"], targets["mesh"], 8)
-        loss_2D_m, loss_offset2D_m, loss_target2D_m, pafs_m = self.meshnet(fpn0, targets["mesh"], 8)
+        loss_2D_m, loss_offset2D_m, loss_target2D_m, pafs_m,features_m = self.meshnet(fpn0, targets["mesh"], 8)
         loss_3D_m, loss_offset3D_m, loss_target3D_m, loss_chamfer_m, loss_3DIoU_m = \
-            self.coordinate3d(pafs_m[-1], targets["mesh"], 8)
+            self.coordinate3d(features_m[-1], targets["mesh"], 8)
         return dict(
             loss_class=loss_class_m,
             loss_2D=loss_2D_m,
@@ -47,21 +47,21 @@ class YOLOx3D(nn.Module):
         self.stage = stage
 
         if stage == 1:
-            # 学習: backbone, classnet
+            # 学習: backbone, meshnet,classnet
             unfreeze_module(self.backbone, True)
             unfreeze_module(self.classnet, True)
-            # 凍結: meshnet, coordinate3d
+            # 凍結: coordinate3d
             freeze_module(self.meshnet, True)
             freeze_module(self.coordinate3d, True)
 
         elif stage == 2:
-            # 凍結: backbone, classnet
-            freeze_module(self.backbone, True)
-            freeze_module(self.classnet, True)
-            # 学習: meshnet
+            # 学習: backbone, meshnet,classnet
+            unfreeze_module(self.backbone, True)
             unfreeze_module(self.meshnet, True)
-            # 凍結: coordinate3d（モニタ用に使っても更新しない）
+            unfreeze_module(self.classnet, True)
+            # 凍結: coordinate3d
             freeze_module(self.coordinate3d, True)
+            # 凍結: coordinate3d（モニタ用に使っても更新しない）
 
         elif stage == 3:
             # 凍結: backbone, classnet, meshnet
@@ -80,45 +80,27 @@ class YOLOx3D(nn.Module):
             assert targets is not None
 
             if self.stage == 1:
-                # === Stage 1: ClassNet のみで学習（backboneにも勾配は流れる）
+                # === Stage 1: classnet のみ学習                
                 loss_class, cls_prob = self.classnet(fpn0, targets["category"], targets["mesh"], 8)
-
-                # MeshNet/Coord3Dはモニタだけ（勾配なし）
-                #with torch.no_grad():
-                #    meshout = self.meshnet(fpn0, targets["mesh"], 8)
-                #    vertices, faces = self.coordinate3d(meshout[-1], targets["mesh"], 8)
-
-                total_loss = loss_class  # 学習に使うのは分類損失だけ
+                total_loss = loss_class  # 学習に使うのは2D/PAF系 classだけ
 
             elif self.stage == 2:
-                # === Stage 2: MeshNet のみ学習
-                # Coord3Dは使うが、MeshNetへは勾配を返さないように入力をdetach
-                loss_2D, loss_offset2D, loss_target2D, pafs = self.meshnet(fpn0, targets["mesh"], 8)
-                #with torch.no_grad():  # TriView2CoordGridはモニタ用のみ
-                #    vertices, faces = self.coordinate3d(pafs[-1].detach(), targets["mesh"], 8)
-                #
-                ## ClassNetはモニタのみ（勾配なし）
-                #with torch.no_grad():
-                #    cls_prob = self.classnet(fpn0, targets["category"], targets["mesh"], 8)
-                
-                total_loss = loss_2D  # 学習に使うのは2D/PAF系だけ
+                # === Stage 2: meshnet classnet  両方で学習（backboneにも勾配は流れる）
+                loss_class, cls_prob = self.classnet(fpn0, targets["category"], targets["mesh"], 8)
+                loss_2D, loss_offset2D, loss_target2D, _,features = self.meshnet(fpn0, targets["mesh"], 8)
+                total_loss = loss_2D+loss_class  
 
             else:  # self.stage == 3
                 # === Stage 3: Coordinate3D のみ学習
-                #with torch.no_grad():
                 # MeshNetは出力だけもらう
-                pafs = self.meshnet(fpn0, targets["mesh"], 8)
-
+                pafs,features = self.meshnet(fpn0, targets["mesh"], 8)
+            
                 # TriView2CoordGridは学習対象
                 loss_3D, loss_offset3D, loss_target3D, loss_chamfer, loss_3DIoU = \
-                    self.coordinate3d(pafs[-1], targets["mesh"], 8)
-
-                # ClassNetはモニタのみ（勾配なし）
-                #with torch.no_grad():
-                #    cls_prob = self.classnet(fpn0, targets["category"], targets["mesh"], 8)
-
+                    self.coordinate3d(features[-1], targets["mesh"], 8)
+            
                 total_loss = loss_3D  # 学習に使うのは3D系だけ
-
+            
             outputs = {
                 "total_loss": total_loss,
                 "loss_class": loss_class,
@@ -136,8 +118,8 @@ class YOLOx3D(nn.Module):
         else:
             # 推論時はそのまま
             cls_prob = self.classnet(fpn0)
-            meshout = self.meshnet(fpn0)
-            vertices, faces = self.coordinate3d(meshout[-1])
+            meshout,features = self.meshnet(fpn0)
+            vertices, faces = self.coordinate3d(features[-1])
             return {"cls_prob": cls_prob, "vertices": vertices, "faces": faces}
 
 

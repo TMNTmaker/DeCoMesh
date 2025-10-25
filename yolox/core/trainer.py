@@ -217,18 +217,33 @@ class Trainer:
             self.scaler.unscale_(self.optimizer)
 
             # 非有限勾配ガード（見つかったら 0化でも良いが、まずはスキップ推奨）
-            bad_grad = False
+            bad_params = []
             for g in self.optimizer.param_groups:
                 for p in g["params"]:
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        bad_grad = True
-                        break
-                if bad_grad: break
+                    if p.grad is None:
+                        continue
+                    if not torch.isfinite(p.grad).all():
+                        bad_params.append(p)
 
-            if bad_grad:
-                logger.error("[GradNaN] non-finite gradient detected; skip this iter")
+            if bad_params:
+                # ---- 詳細ログ：どのparamが壊れてるか ----
+                for p in bad_params[:20]:  # 多すぎるとログが爆発するので上限
+                    pname = self._param_name.get(id(p), "<unknown>")
+                    modname, modtype = self._mod_of_param_name(pname)
+                    g = p.grad.detach()
+                    # 非有限を有限に置き換えた統計（ログ用）
+                    g_num = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
+                    gmin = float(g_num.min().item())
+                    gmax = float(g_num.max().item())
+                    gmean = float(g_num.mean().item())
+                    logger.error(
+                        f"[GradNaN] pname={pname} mod={modname}({modtype}) "
+                        f"shape={tuple(p.shape)} min={gmin:.3e} max={gmax:.3e} mean={gmean:.3e}"
+                    )
+
+                # 1) このイテレーションは捨てる（重みを汚さない）
                 self.optimizer.zero_grad(set_to_none=True)
-                # ★ unscale_ 済みなので必ず update() を呼んで状態をリセット
+                # 2) unscale_ を呼んだので scaler.update() は必ず呼んで状態をリセット
                 self.scaler.update()
                 return
 
@@ -328,8 +343,8 @@ class Trainer:
         
         total = self.max_epoch
         if not hasattr(self.exp, "stage_epochs"):
-            e1 = 0#max(1, total // 3)
-            e2 = 0#max(1, (total - e1) // 2)
+            e1 = max(1, total // 3)
+            e2 = max(1, (total - e1) // 2)
             e3 = max(1, total - e1 - e2)
             self.exp.stage_epochs = (e1, e2, e3)
         self._stage_boundaries = (
@@ -343,6 +358,17 @@ class Trainer:
             b1, b2, _ = self._stage_boundaries
             stage = 1 if curr_epoch < b1 else (2 if curr_epoch < b2 else 3)
             mm = self.model.module if is_parallel(self.model) else self.model
+            self._param_name = {id(p): n for n, p in mm.named_parameters()}
+            self._module_type = {n: type(m).__name__ for n, m in mm.named_modules()}
+
+            def _mod_of_param_name(pname: str):
+                # "coordinate3d.encoder.conv_shared.1.weight" -> "coordinate3d.encoder.conv_shared.1"
+                if "." in pname:
+                    prefix = pname.rsplit(".", 1)[0]
+                    return prefix, self._module_type.get(prefix, "")
+                return "", ""
+            self._mod_of_param_name = _mod_of_param_name
+            
             mm.set_stage(stage)
 
             # ★ ステージに合わせて Optimizer を強制再構築
@@ -352,7 +378,7 @@ class Trainer:
             self._filter_optimizer_params()
             self._nan_hooks = []
             #self._nan_hooks += add_nan_hooks(mm.meshnet,      name_prefix="meshnet.")
-            self._nan_hooks += add_nan_hooks(mm.coordinate3d, name_prefix="coord3d.")
+            #self._nan_hooks += add_nan_hooks(mm.coordinate3d, name_prefix="coord3d.")
             # デバッグ出力
             def _cnt_trainable(mod): return sum(p.requires_grad for p in mod.parameters())
             cnts = {

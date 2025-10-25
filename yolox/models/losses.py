@@ -81,6 +81,32 @@ def masked_mse_loss(pred, target, mask, eps=1e-12, anchor=None):
         loss = loss + 0.0 * anchor.sum()
     return loss
 
+def masked_charbonnier(
+    pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None,
+    eps: float = 1e-6, delta: float = 1e-3, anchor_param: torch.Tensor | None = None
+):
+    pred_f, target_f = pred.float(), target.float()
+    finite = torch.isfinite(pred_f) & torch.isfinite(target_f)
+    if mask is not None:
+        #mask を pred/target と同じ形状に拡張 
+        if mask.dim() == pred.dim() - 1: 
+            mask = mask.unsqueeze(1).expand_as(pred) 
+        else: 
+            mask = mask.expand_as(pred)
+        
+        finite = finite & mask.to(torch.bool)
+    m = finite.to(dtype=pred_f.dtype)
+
+    diff = pred_f - target_f
+    # ρ(x) = sqrt(x^2 + δ^2)  （δ は小さな定数）
+    rho  = torch.sqrt(diff * diff + delta * delta)
+
+    num = (rho * m).sum()
+    den = m.sum().clamp_min(1)
+    loss = num / den
+    if anchor_param is not None and not loss.requires_grad:
+        loss = loss + 0.0 * anchor_param.sum()
+    return loss
 
 
 TensorLike = Union[torch.Tensor, List, torch.Tensor]

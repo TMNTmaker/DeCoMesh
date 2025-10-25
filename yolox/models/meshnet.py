@@ -19,13 +19,17 @@ class MeshNet(nn.Module):
         
     def forward(self, x,labels=None,reduction_mag=None):
         pafs = []
+        features = []
         feature_map = x
-        h1= self.stage_1(feature_map)
+        h1,F1= self.stage_1(feature_map)
         pafs.append(h1)
-        h1 = self.stage_2(torch.cat([h1, feature_map], dim = 1))
+        features.append(F1)
+        h1,F1 = self.stage_2(torch.cat([h1, feature_map], dim = 1))
         pafs.append(h1)
-        h1 = self.stage_3(torch.cat([h1, feature_map], dim = 1))
+        features.append(F1)
+        h1,F1 = self.stage_3(torch.cat([h1, feature_map], dim = 1))
         pafs.append(h1)
+        features.append(F1)
         #h1 = self.stage_4(torch.cat([h1, feature_map], dim = 1))
         #pafs.append(h1)
         #h1 = self.stage_5(torch.cat([h1, feature_map], dim = 1))
@@ -45,9 +49,9 @@ class MeshNet(nn.Module):
                                                  reduction_mag)    
             torch.cuda.synchronize(); t2 = time.time()
             print(f"Data processing time: {t1-t0:.4f}s, Loss calculation time: {t2-t1:.4f}s")
-            return loss_total,loss_offset,loss_target,pafs#,loss_chamfer_xy,loss_chamfer_yz,loss_chamfer_zx,pafs
+            return loss_total,loss_offset,loss_target,pafs,features
         else:
-            return pafs  
+            return pafs,features  
     
     
     #Data processing time: 1.3204s
@@ -259,29 +263,29 @@ class MeshNet(nn.Module):
                                                         pafs_t[:, [0,1,4,5,8,9]])                      
             loss_target = lambda_target*mean_square_error(pafs_y[:, [2,3,6,7,10,11]], 
                                                         pafs_t[:, [2,3,6,7,10,11]])                      
-            #loss_offset_xy = lambda_offset*masked_mse_loss(pafs_y[:, [0,1]], 
+            #
+            #loss_offset_xy = lambda_offset*masked_charbonnier(pafs_y[:, [0,1]], 
             #                                            pafs_t[:, [0,1]],
             #                                            ignore_mask[:,0])           
-            #loss_offset_yz = lambda_offset*masked_mse_loss(pafs_y[:, [4,5]], 
+            #loss_offset_yz = lambda_offset*masked_charbonnier(pafs_y[:, [4,5]], 
             #                                            pafs_t[:, [4,5]],
             #                                            ignore_mask[:,1])           
-            #loss_offset_zx = lambda_offset*masked_mse_loss(pafs_y[:, [8,9]], 
+            #loss_offset_zx = lambda_offset*masked_charbonnier(pafs_y[:, [8,9]], 
             #                                            pafs_t[:, [8,9]],
             #                                            ignore_mask[:,2])           
             #
-            #loss_target_xy = lambda_target*masked_mse_loss(pafs_y[:, [2,3]],
+            #loss_target_xy = lambda_target*masked_charbonnier(pafs_y[:, [2,3]],
             #                                            pafs_t[:, [2,3]],
             #                                            ignore_mask[:,0])
-            #loss_target_yz = lambda_target*masked_mse_loss(pafs_y[:, [6,7]],
+            #loss_target_yz = lambda_target*masked_charbonnier(pafs_y[:, [6,7]],
             #                                            pafs_t[:, [6,7]],
             #                                            ignore_mask[:,1])
-            #loss_target_zx = lambda_target*masked_mse_loss(pafs_y[:, [10,11]],
+            #loss_target_zx = lambda_target*masked_charbonnier(pafs_y[:, [10,11]],
             #                                            pafs_t[:, [10,11]],
             #                                            ignore_mask[:,2])
             #
             #loss_offset = loss_offset_xy + loss_offset_yz + loss_offset_zx 
             #loss_target = loss_target_xy + loss_target_yz + loss_target_zx 
-        
             loss_total += loss_offset + loss_target
         torch.cuda.synchronize(); t1 = time.time()
         print(f"mesh loss processing time: {t1-t0:.4f}s")
@@ -307,10 +311,10 @@ class Stage_1(nn.Module):
         h1 = self.relu(self.conv1_CPM_L1(x)) # branch1
         #h1 = self.relu(self.conv2_CPM_L1(h1))
         #h1 = self.relu(self.conv3_CPM_L1(h1))
-        h1 = self.relu(self.conv4_CPM_L1(h1))
-        h1 = self.conv5_CPM_L1(h1)
-        h1 = torch.tanh(self.bn(h1))
-        return h1
+        F1 = self.relu(self.conv4_CPM_L1(h1))
+        h1 = self.conv5_CPM_L1(F1)
+        h1 = self.softsign(self.bn(h1))
+        return h1,F1
     
 class Stage_x(nn.Module):
     def __init__(self):
@@ -332,7 +336,7 @@ class Stage_x(nn.Module):
         #h1 = self.relu(self.conv3_L1(h1))
         #h1 = self.relu(self.conv4_L1(h1))
         #h1 = self.relu(self.conv5_L1(h1))
-        h1 = self.relu(self.conv6_L1(h1))
-        h1 = self.conv7_L1(h1)
-        h1 = torch.tanh(self.bn(h1))
-        return h1
+        F1 = self.relu(self.conv6_L1(h1))
+        h1 = self.conv7_L1(F1)
+        h1 = self.softsign(self.bn(h1))
+        return h1,F1

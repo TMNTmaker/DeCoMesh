@@ -17,7 +17,7 @@ class TripleViewEncoder(nn.Module):
         super().__init__()
         # 共有畳み込み層
         self.conv_shared = nn.Sequential(
-            nn.Conv2d(12, 64, 3, padding=1),
+            nn.Conv2d(128, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             )
@@ -42,10 +42,7 @@ class TripleViewEncoder(nn.Module):
         
         
     def forward(self, x):
-        
-        #x: (B, 6 ,H,W) -> (B, 2, H, W),(B, 2, H, W),(B, 2, H, W) 
-        #x1, x2, x3 = torch.split(x, 2, dim=1)
-        
+                
         #xf = self.conv_shared(x1)
         #xs= self.conv_shared(x2)
         #xt = self.conv_shared(x3)
