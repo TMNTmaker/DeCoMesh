@@ -823,11 +823,10 @@ def cluster_vectors3D_torch_fast(
     
     return vertices, faces, index_map
 
-#@torch.no_grad()
+@torch.no_grad()
 def postprocess3D(
     prediction: torch.Tensor,  # (B, D, H, W, 6)
     mag: float,
-    threshold_deg: float = 10.0,
     min_norm: float = 1e-4,
     merge_radius: float = 5.0,
 ):    

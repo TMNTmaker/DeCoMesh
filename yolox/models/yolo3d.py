@@ -74,8 +74,17 @@ class YOLOx3D(nn.Module):
     def forward(self, x, targets=None):
         fpn_outs = self.backbone(x)
         fpn0 = fpn_outs[0]
-        loss_class=loss_2D=loss_offset2D=loss_target2D=loss_3D=loss_offset3D=loss_target3D=torch.nan
-        loss_3DIoU=loss_chamfer=torch.nan
+        loss_class=loss_2D=loss_offset2D=loss_target2D=loss_3D=total_loss=torch.nan
+        
+        outputs = {
+                "total_loss": total_loss,
+                "loss_class": loss_class,
+                "loss_2D": loss_2D,
+                "loss_offset2D": loss_offset2D,
+                "loss_target2D": loss_target2D,
+                "loss_3D": loss_3D,
+            }
+        
         if self.training:
             assert targets is not None
 
@@ -96,22 +105,18 @@ class YOLOx3D(nn.Module):
                 pafs,features = self.meshnet(fpn0, targets["mesh"], 8)
             
                 # TriView2CoordGridは学習対象
-                loss_3D, loss_offset3D, loss_target3D, loss_chamfer, loss_3DIoU = \
+                loss_3D, loss_dict = \
                     self.coordinate3d(features[-1], targets["mesh"], 8)
-            
+                
                 total_loss = loss_3D  # 学習に使うのは3D系だけ
-            
-            outputs = {
+                outputs |= loss_dict
+            outputs |= {
                 "total_loss": total_loss,
                 "loss_class": loss_class,
                 "loss_2D": loss_2D,
                 "loss_offset2D": loss_offset2D,
                 "loss_target2D": loss_target2D,
                 "loss_3D": loss_3D,
-                "loss_offset3D": loss_offset3D,
-                "loss_target3D": loss_target3D,
-                "loss_chamfer": loss_chamfer,
-                "loss_3DIoU": loss_3DIoU,
             }
             return outputs
 

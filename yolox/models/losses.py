@@ -109,9 +109,334 @@ def masked_charbonnier(
     return loss
 
 
+
+# ---------- ユーティリティ ----------
+
+def _is_3d(t: torch.Tensor) -> bool:
+    # (B,1,D,H,W) なら 3D、(B,1,H,W) なら 2D
+    return t.dim() == 5
+
+def _make_spherical_kernel_3d(radius: int, device, dtype=torch.float32) -> torch.Tensor:
+    """
+    3D 球（半径=radius）の構造要素を [1,1,Kd,Kh,Kw] で返す（バイナリ膨張用）。
+    """
+    r = radius
+    z, y, x = torch.meshgrid(
+        torch.arange(-r, r+1, device=device, dtype=dtype),
+        torch.arange(-r, r+1, device=device, dtype=dtype),
+        torch.arange(-r, r+1, device=device, dtype=dtype),
+        indexing='ij'
+    )
+    dist2 = z*z + y*y + x*x
+    ker = (dist2 <= (r*r)).to(dtype)
+    return ker.view(1, 1, *(ker.shape))  # [1,1,Kd,Kh,Kw]
+
+def _make_disk_kernel_2d(radius: int, device, dtype=torch.float32) -> torch.Tensor:
+    """
+    2D 円（半径=radius）の構造要素を [1,1,Kh,Kw] で返す（バイナリ膨張用）。
+    """
+    r = radius
+    y, x = torch.meshgrid(
+        torch.arange(-r, r+1, device=device, dtype=dtype),
+        torch.arange(-r, r+1, device=device, dtype=dtype),
+        indexing='ij'
+    )
+    dist2 = y*y + x*x
+    ker = (dist2 <= (r*r)).to(dtype)
+    return ker.view(1, 1, *(ker.shape))  # [1,1,Kh,Kw]
+
+def _gaussian1d(sigma: float, radius: Optional[int]=None, device=None, dtype=torch.float32) -> torch.Tensor:
+    if radius is None:
+        # 3σ で十分に減衰するので kernel 半径は ceil(3σ)
+        radius = max(1, int(torch.ceil(torch.tensor(3*sigma)).item()))
+    xs = torch.arange(-radius, radius+1, device=device, dtype=dtype)
+    ker = torch.exp(-0.5 * (xs / sigma)**2)
+    ker = ker / ker.sum().clamp_min(1e-12)
+    return ker.view(1, 1, -1)  # conv1d 互換
+
+# ---------- バイナリ膨張（hard positive 拡張） ----------
+
+@torch.no_grad()
+def positive_dilation(mask: torch.Tensor, radius: int, ignore_mask: Optional[torch.Tensor]=None) -> torch.Tensor:
+    """
+    バイナリ膨張：半径 r の球/円で正例(=1)を膨張させる。
+    Args:
+        mask        : (B,1,D,H,W) or (B,1,H,W), 値は {0,1}
+        radius      : 膨張半径（voxel/pixel）
+        ignore_mask : True=無視（拡張から除外）
+    Returns:
+        dilated     : 同形状 {0,1}
+    """
+    assert mask.dim() in (4,5) and mask.size(1) == 1
+    device, dtype = mask.device, mask.dtype
+    x = mask.float()
+
+    if ignore_mask is not None:
+        # 無視領域は 0 にしてから膨張
+        x = x * (~ignore_mask).float()
+
+    if _is_3d(mask):
+        ker = _make_spherical_kernel_3d(radius, device=device, dtype=torch.float32)  # [1,1,Kd,Kh,Kw]
+        pad = tuple([radius]*6)  # (W_left,W_right,H_left,H_right,D_left,D_right)
+        y = F.conv3d(F.pad(x, pad, mode='constant', value=0.0), ker, bias=None, stride=1)
+    else:
+        ker = _make_disk_kernel_2d(radius, device=device, dtype=torch.float32)      # [1,1,Kh,Kw]
+        pad = (radius, radius, radius, radius)
+        y = F.conv2d(F.pad(x, pad, mode='constant', value=0.0), ker, bias=None, stride=1)
+
+    out = (y > 0).to(mask.dtype)
+
+    if ignore_mask is not None:
+        out = out * (~ignore_mask).to(out.dtype)
+    return out
+
+# ---------- ガウシアン拡散（soft positive 拡張） ----------
+
+@torch.no_grad()
+def positive_gaussian_spread(
+    mask: torch.Tensor,
+    sigma: Tuple[float, float, float] | float = 1.0,
+    radius: Optional[int] = None,
+    peak: float = 1.0,
+    floor: float = 0.0,
+    keep_hard_peak: bool = True,
+    ignore_mask: Optional[torch.Tensor]=None,
+) -> torch.Tensor:
+    """
+    ガウシアンで正例を周辺へ拡散（ソフトラベル 0..1）。
+    3D は分離畳み込み conv1d を3回（Z,Y,X）で実装 → 高速＆省メモリ。
+    2D は Y, X の順に2回。
+    Args:
+        mask         : (B,1,D,H,W) or (B,1,H,W), バイナリ {0,1}
+        sigma        : 標準偏差 [voxel/pixel]。3タプルで各軸別 σ 指定可
+        radius       : カーネル半径（未指定なら ceil(3σ)）
+        peak         : 中心値の最大（通常 1.0）
+        floor        : 最小値（0.0〜）
+        keep_hard_peak: 中心を必ず1.0にする（True推奨）
+        ignore_mask  : True=無視（出力も 0 に）
+    Returns:
+        soft_target  : 同形状, [floor, peak]
+    """
+    assert mask.dim() in (4,5) and mask.size(1) == 1
+    device = mask.device
+
+    x = mask.float()
+    if ignore_mask is not None:
+        x = x * (~ignore_mask).float()
+
+    # σ の正規化
+    if isinstance(sigma, (tuple, list)):
+        if _is_3d(mask):
+            assert len(sigma) == 3, "3Dのとき sigma は (σz,σy,σx)"
+            sz, sy, sx = map(float, sigma)
+        else:
+            assert len(sigma) == 2 or len(sigma) == 3, "2Dのとき sigma は (σy,σx) or (σz,σy,σx) でOK"
+            sy, sx = float(sigma[-2]), float(sigma[-1])
+            sz = None
+    else:
+        s = float(sigma)
+        if _is_3d(mask):
+            sz = sy = sx = s
+        else:
+            sz = None; sy = sx = s
+
+    # 分離ガウシアン畳み込み
+    def _conv1d_along_dim(x, ker1d, dim: int):
+        # dim: 2D→(H=2, W=3), 3D→(D=2, H=3, W=4)（NCHW/ NCDHW の次元番号）
+        # convXdで実現するために次元を入れ替え
+        if x.dim() == 5:
+            # (B,1,D,H,W) → 対象dimを length として conv1d 相当
+            if dim == 2:   # D
+                x_perm = x
+                k = ker1d.view(1, 1, -1, 1, 1)
+                pad = (0,0, 0,0, ker1d.shape[-1]//2, ker1d.shape[-1]//2)
+                return F.conv3d(F.pad(x_perm, pad), k)
+            elif dim == 3: # H
+                x_perm = x
+                k = ker1d.view(1, 1, 1, -1, 1)
+                pad = (0,0, ker1d.shape[-1]//2, ker1d.shape[-1]//2, 0,0)
+                return F.conv3d(F.pad(x_perm, pad), k)
+            elif dim == 4: # W
+                x_perm = x
+                k = ker1d.view(1, 1, 1, 1, -1)
+                pad = (ker1d.shape[-1]//2, ker1d.shape[-1]//2, 0,0, 0,0)
+                return F.conv3d(F.pad(x_perm, pad), k)
+            else:
+                raise ValueError
+        else:
+            # (B,1,H,W)
+            if dim == 2:   # H
+                k = ker1d.view(1, 1, -1, 1)
+                pad = (0,0, ker1d.shape[-1]//2, ker1d.shape[-1]//2)
+                return F.conv2d(F.pad(x, pad), k)
+            elif dim == 3: # W
+                k = ker1d.view(1, 1, 1, -1)
+                pad = (ker1d.shape[-1]//2, ker1d.shape[-1]//2, 0,0)
+                return F.conv2d(F.pad(x, pad), k)
+            else:
+                raise ValueError
+
+    y = x
+    if _is_3d(mask):
+        kz = _gaussian1d(sz, radius, device=device)
+        ky = _gaussian1d(sy, radius, device=device)
+        kx = _gaussian1d(sx, radius, device=device)
+        y = _conv1d_along_dim(y, kz, dim=2)
+        y = _conv1d_along_dim(y, ky, dim=3)
+        y = _conv1d_along_dim(y, kx, dim=4)
+    else:
+        ky = _gaussian1d(sy, radius, device=device)
+        kx = _gaussian1d(sx, radius, device=device)
+        y = _conv1d_along_dim(y, ky, dim=2)
+        y = _conv1d_along_dim(y, kx, dim=3)
+
+    # 正規化＆ピーク処理
+    if keep_hard_peak:
+        # 元の 1 の位置は必ず peak に
+        y = torch.maximum(y, mask.float() * float(peak))
+    # floor〜peak にクリップ
+    y = y.clamp(min=float(floor), max=float(peak))
+
+    if ignore_mask is not None:
+        y = y * (~ignore_mask).float()
+    return y
+
+# ---------- まとめ：正例拡張のフロント関数 ----------
+
+@torch.no_grad()
+def make_positive_targets(
+    hard_mask: torch.Tensor,                          # (B,1,D,H,W) or (B,1,H,W), {0,1}
+    method: str = "gaussian",                         # "gaussian" or "dilation" or "both"
+    sigma: Tuple[float, float, float] | float = 1.0,  # gaussian の σ
+    radius: int = 1,                                  # dilation の半径（both の時も使用）
+    alpha_soft: float = 1.0,                          # hard と soft を混ぜる係数。1=softのみ、0=hardのみ
+    floor: float = 0.0, peak: float = 1.0,
+    ignore_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    使い方に迷ったら：
+        - まず method="gaussian", sigma=1.0, alpha_soft=1.0（完全ソフト）
+        - “中心は必ず1.0” にしたい → positive_gaussian_spread の keep_hard_peak=True が既定
+    戻り値は Focal BCE の target にそのまま使える [0,1]。
+    """
+    hard = hard_mask.to(dtype=torch.float32)
+    if method == "dilation":
+        dil = positive_dilation(hard_mask, radius=radius, ignore_mask=ignore_mask).float()
+        tgt = dil
+    elif method == "gaussian":
+        soft = positive_gaussian_spread(hard_mask, sigma=sigma, floor=floor, peak=peak, ignore_mask=ignore_mask)
+        if alpha_soft >= 1.0:
+            tgt = soft
+        elif alpha_soft <= 0.0:
+            tgt = hard
+        else:
+            tgt = alpha_soft*soft + (1.0-alpha_soft)*hard
+    elif method == "both":
+        dil = positive_dilation(hard_mask, radius=radius, ignore_mask=ignore_mask).float()
+        soft = positive_gaussian_spread(dil, sigma=sigma, floor=floor, peak=peak, ignore_mask=ignore_mask)
+        tgt = alpha_soft*soft + (1.0-alpha_soft)*dil
+    else:
+        raise ValueError("method must be 'gaussian' | 'dilation' | 'both'")
+
+    if ignore_mask is not None:
+        tgt = tgt * (~ignore_mask).float()
+    return tgt.clamp_(0.0, 1.0)
+
+def focal_bce_with_logits(
+    logits,              # (B,1,D,H,W)
+    target,              # (B,1,D,H,W) in [0,1]  ソフトGT可
+    gamma: float = 2.0,
+    alpha: float = 0.25,
+    ignore_mask=None,    # (B,1,D,H,W) bool, True=無視
+    eps: float = 1e-6,
+):
+    # 1) BCE (logit版, 安定)
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, target, reduction='none'
+    )
+
+    # 2) p, p_t, alpha_t
+    p = torch.sigmoid(logits)
+    p_t = target * p + (1 - target) * (1 - p)          # soft label 対応
+    alpha_t = target * alpha + (1 - target) * (1 - alpha)
+
+    # 3) focal 係数
+    focal_factor = (1.0 - p_t).clamp(min=0.0).pow(gamma)
+
+    # 4) 無視マスク
+    if ignore_mask is not None:
+        w = (~ignore_mask).to(bce.dtype)
+    else:
+        w = torch.ones_like(bce)
+
+    loss = w * alpha_t * focal_factor * bce
+
+    # 5) 正規化（有効画素で割る）
+    denom = w.sum().clamp_min(1.0)
+    return loss.sum() / denom
+
+def loss_sparse_vector_field(p_logit, v_pred, m_pos, v_gt, 
+                             alpha=1.0, beta=0.2, lam_dir=1.0, lam_mag=1.0, gamma=2.0, eps=1e-6):
+    """
+    p_logit: (B,1,D,H,W), v_pred/v_gt: (B,3,D,H,W), m_pos∈{0,1}
+    """
+    # 1) 検出: Focal BCE
+    #p = torch.sigmoid(p_logit)
+    #pt = torch.where(m_pos.detach()>0, p, 1-p)
+    #alpha_focal = 0.25
+    ## クラスごとの alpha を適用する例（任意）
+    #alpha_t = torch.where(m_pos.detach() > 0, alpha_focal, 1.0 - alpha_focal)
+    #focal = -alpha_t * (1 - pt).pow(gamma) * torch.log(pt.clamp_min(1e-6))
+    ## focal = -alpha_focal*(1-pt).pow(gamma)*torch.log(pt.clamp_min(1e-6))
+    #L_det = focal.mean()
+    
+    
+    # 1) ガウシアン拡散だけ（σ=1.0）
+    #m_pos = make_positive_targets(
+    #    m_pos, method="gaussian", sigma=1.0, alpha_soft=1.0
+    #)
+
+    # 2) まず膨張（r=1）→ その結果をガウシアン拡散（σ=1.0）
+    Sm_pos = make_positive_targets(
+        m_pos, method="both", radius=1, sigma=1.0, alpha_soft=1.0
+    )
+
+
+
+    
+    L_det = focal_bce_with_logits(
+    p_logit,                # logits
+    m_pos,             # 0/1でもソフトでもOK
+    gamma=gamma,
+    alpha=0.1,
+    ignore_mask=None,  # あれば渡す
+    )
+    
+    
+    
+    # 2) 回帰（正例のみ）
+    # 方向 loss
+    v_gt_norm = v_gt.norm(dim=1, keepdim=True).clamp_min(eps)
+    v_pred_norm = v_pred.norm(dim=1, keepdim=True).clamp_min(eps)
+    cos_sim = (v_pred * v_gt).sum(1, keepdim=True) / (v_pred_norm * v_gt_norm)
+    L_dir = (1.0 - cos_sim.clamp(-1,1)).squeeze(1)  # (B,D,H,W)
+
+    # 大きさ loss
+    L_mag = torch.nn.functional.smooth_l1_loss(v_pred_norm, v_gt_norm, reduction='none').squeeze(1)
+
+    L_vec = (lam_dir*L_dir + lam_mag*L_mag)
+    L_vec = (L_vec * m_pos).sum() / (m_pos.sum().clamp_min(1.0))
+
+    # 3) 負例抑制（focal-MSE）
+    w_neg = (v_pred_norm.squeeze(1)).pow(gamma)  # 大きい外れだけ罰する
+    L_neg = ((1 - m_pos) * w_neg * (v_pred**2).sum(1)).sum() / ((1 - m_pos).sum().clamp_min(1.0))
+
+    return L_det + alpha*L_vec + beta*L_neg, L_det,L_vec,L_neg
+
+
 TensorLike = Union[torch.Tensor, List, torch.Tensor]
 
-#@torch.no_grad()
+@torch.no_grad()
 def chamfer_distance(
     predict: List[List[TensorLike]],
     ground:  List[List[TensorLike]],
@@ -219,7 +544,7 @@ def chamfer_distance(
 import torch
 from typing import List, Tuple, Sequence
 
-#@torch.no_grad()
+@torch.no_grad()
 def IoU3D_voxel(
     predict: List[List[TensorLike]],
     ground:  List[List[TensorLike]],

@@ -59,26 +59,23 @@ class LowRankVoxelFusion(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
         self.out_channels = 216
-        assert self.out_channels % 6 == 0, "in_channels must be a multiple of 6"
+        assert self.out_channels % 8 == 0, "in_channels must be a multiple of 8"
         self.decoder_front = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear'),
             nn.Conv2d(in_channels, self.out_channels, 3, padding=1),
             nn.BatchNorm2d(self.out_channels),
-            #nn.Flatten(2, 3)
         )
         self.decoder_side = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear'),
             nn.Conv2d(in_channels, self.out_channels, 3, padding=1),
             nn.BatchNorm2d(self.out_channels),
-            #nn.Flatten(2, 3)
         )
         self.decoder_top = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear'),
             nn.Conv2d(in_channels, self.out_channels, 3, padding=1),
             nn.BatchNorm2d(self.out_channels),
-            #nn.Flatten(2, 3)
         )
-        self.norm3d = nn.GroupNorm(num_groups=2, num_channels=6, eps=1e-5, affine=True)
+        self.norm3d = nn.GroupNorm(num_groups=2, num_channels=8, eps=1e-5, affine=True)
 
         self.softsign = nn.Softsign()
     def forward(self, front,side,top):
@@ -89,25 +86,16 @@ class LowRankVoxelFusion(nn.Module):
         W,Z=side.shape[-2:]
         voxel = torch.einsum(
             'bcfxy, bcfyz, bcfzx -> bczyx',
-            front.view(-1, 6, self.out_channels//6, H, W),
-            side.view(-1, 6, self.out_channels//6, W, Z),
-            top.view(-1, 6, self.out_channels//6, Z, H),
-        ) / (self.out_channels/6)
+            front.view(-1, 8, self.out_channels//8, H, W),
+            side.view(-1, 8, self.out_channels//8, W, Z),
+            top.view(-1, 8, self.out_channels//8, Z, H),
+        ) / (self.out_channels/8)
         
+        voxel = self.norm3d(voxel)
         
-        from torch.cuda.amp import autocast
-
-        # voxel: [B, C, D, H, W]
-        voxel = torch.nan_to_num(voxel, nan=0.0, posinf=1e4, neginf=-1e4)
-        voxel = voxel.clamp(-1e4, 1e4)
-
-        # BNは確実にfp32で
-        with autocast(enabled=False):
-            
-            y = self.norm3d(voxel.float())
-        voxel_bn = y.to(voxel.dtype)
-        
-        return  self.softsign(voxel_bn)#torch.tanh(voxel_bn)
+        offtgt=self.softsign(voxel[:,:6])
+        mask_logit = voxel[:,6:]
+        return  offtgt,mask_logit
 
 class TriView2CoordGrid(nn.Module):
     """エンドツーエンドネットワーク"""
@@ -120,7 +108,7 @@ class TriView2CoordGrid(nn.Module):
     def forward(self, x,labels=None,reduction_mag=None):
         
         front, top, side = self.encoder(x)
-        vector_field_y = self.decoder(front, side,top)
+        vector_field_y,mask_y = self.decoder(front, side,top)
         if self.training:
             assert labels is not None, "Training requires target labels" 
             assert reduction_mag is not None, "Training requires reduction_mag"
@@ -128,29 +116,32 @@ class TriView2CoordGrid(nn.Module):
             
             joint_list = labels
             torch.cuda.synchronize(); t0 = time.time()    
-            vector_field_t,ignore_mask= self.data_procces_torch(vector_field_y,joint_list,reduction_mag)
+            vector_field_t,mask_t= self.data_procces_torch(vector_field_y,joint_list,reduction_mag)
             torch.cuda.synchronize(); t1 = time.time()
             print(f"Label grid build time: {t1-t0:.4f}s")            
             
             
             torch.cuda.synchronize(); t0 = time.time()
-            groundpolygon = postprocess3D(vector_field_t,reduction_mag)
+            groundpolygon = postprocess3D(vector_field_t,
+                            reduction_mag)
             torch.cuda.synchronize(); t1 = time.time()
-            predictpolygon = postprocess3D(vector_field_y,reduction_mag)
+            predictpolygon = postprocess3D(vector_field_y,
+                            reduction_mag)
             torch.cuda.synchronize(); t2 = time.time()
             print(f"Ground polygon processing time: {t1-t0:.4f}s  Predict polygon processing time: {t2-t1:.4f}s")
 
             
-            loss,loss_offset,loss_target,loss_chamfer,loss_IoU3D=\
+            loss,loss_dict=\
                 self.loss_all(
                     vector_field_y,
                     vector_field_t,
+                    mask_y,
+                    mask_t,
                     groundpolygon, 
                     predictpolygon, 
-                    ignore_mask,
                     reduction_mag)
 
-            return loss,loss_offset,loss_target,loss_chamfer,loss_IoU3D  
+            return loss,loss_dict  
         else:
             pred=postprocess3D(vector_field_y,8)
             #groups_as_list(vector_field_y[1])
@@ -164,17 +155,16 @@ class TriView2CoordGrid(nn.Module):
         joint_list: torch.Tensor,        # [B, N, F, 4, 3]  四角形x(x,y,z)
         reduction_mag: float,
         out_dtype: torch.dtype | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple [torch.Tensor , torch.Tensor]:
         
         """
         Returns:
-            pafs:         (B, 6, D, H, W)[off_z, off_y, off_x, tgt_z, tgt_y, tgt_x]  
-            ignore_mask:  [B, 1,  D,H, W]  (0=valid, 1=ignore)
+            pafs: (B, 8, D, H, W)[off_mask, off_z, off_y, off_x, off_mask, tgt_z, tgt_y, tgt_x]  
         """
         device = x.device
         B, _,D, H, W = x.shape
         r = float(reduction_mag)
-        pafs   = torch.zeros((B, 6, D, H, W), device=device, dtype=torch.float32) 
+        pafs   = torch.zeros((B, 8, D, H, W), device=device, dtype=torch.float32) 
         
         jl = joint_list.to(device=device, dtype=torch.float32)  # [B,N,F,4,3]
         
@@ -202,7 +192,7 @@ class TriView2CoordGrid(nn.Module):
             [[sqrt3_2, sqrt2_2, sqrt3_2],
             [sqrt2_2, demc2_2, sqrt2_2],
             [sqrt3_2, sqrt2_2, sqrt3_2]],
-        ], device=  "cuda", dtype=torch.float32)#*0.75  # (3,3,3)
+        ], device=device, dtype=torch.float32)#*0.75  # (3,3,3)
 
         def _k_smallest_mask(dist: torch.Tensor, k: int = 1) -> torch.Tensor:
             """
@@ -280,18 +270,18 @@ class TriView2CoordGrid(nn.Module):
                 a_mask =_k_smallest_mask(dA2)
                 # B側
                 b_mask = _k_smallest_mask(dB2)
-                keep_mask = a_mask | b_mask
+                keep_off = a_mask | b_mask
 
                 off_x = torch.where(use_B, off_xb, off_xa)
                 off_y = torch.where(use_B, off_yb, off_ya)
                 off_z = torch.where(use_B, off_zb, off_za)
 
                 # 最小点のみ残す
-                off_x = off_x * keep_mask
-                off_y = off_y * keep_mask
-                off_z = off_z * keep_mask
+                off_x = off_x * keep_off
+                off_y = off_y * keep_off
+                off_z = off_z * keep_off
 
-                # tgt（H→A もしくは H→B の単位ベクトル、近い方）
+                # tgt（H→A もしくは H→B のベクトル、近い方）
                 ACx = A3[0] - Hx; ACy = A3[1] - Hy; ACz = A3[2] - Hz
                 BCx = B3[0] - Hx; BCy = B3[1] - Hy; BCz = B3[2] - Hz
                 dA = torch.sqrt(ACx*ACx + ACy*ACy + ACz*ACz + 1e-12)
@@ -313,7 +303,7 @@ class TriView2CoordGrid(nn.Module):
                 Px = (A3[0] + B3[0]) * 0.5
                 Py = (A3[1] + B3[1]) * 0.5
                 Pz = (A3[2] + B3[2]) * 0.5
-                # 単位ベクトルなのでそのまま1ステップ先を終端とする
+                # そのまま1ステップ先を終端とする
                 ex = Xc + tgt_x
                 ey = Yc + tgt_y
                 ez = Zc + tgt_z
@@ -323,10 +313,15 @@ class TriView2CoordGrid(nn.Module):
                 tgt_y = tgt_y * keep_tgt
                 tgt_z = tgt_z * keep_tgt
 
-                # 書き込み：未使用セルかつ draw の位置だけに限定して書く
-                patch = pafs[b, :, min_z:max_z, min_y:max_y, min_x:max_x]  # [6, dz, dy, dx]
 
-                vals = [off_z, off_y, off_x, tgt_z, tgt_y, tgt_x]  # [6, dz, dy, dx]
+                off_mask = keep_off.to(dtype=torch.float32)
+                tgt_mask = keep_tgt.to(dtype=torch.float32)
+  
+
+                # 書き込み：未使用セルかつ draw の位置だけに限定して書く
+                patch = pafs[b, :, min_z:max_z, min_y:max_y, min_x:max_x]  # [8, dz, dy, dx]
+
+                vals = [off_z, off_y, off_x, tgt_z, tgt_y, tgt_x,off_mask,tgt_mask]  # [8, dz, dy, dx]
                 for i, val in enumerate(vals):
                     free = (patch[i] == 0) #& draw
                     patch[i][free] = val[free]
@@ -341,23 +336,21 @@ class TriView2CoordGrid(nn.Module):
             for nf in idxs:
                 n, f = int(nf[0].item()), int(nf[1].item())
                 draw_view(b, jl[b, n, f])  # xyz
-            block = pafs[:, :].sum(dim=1).abs()             # [B,6,D,H,W]
             
-            ignore_mask = torch.stack([(block > 1e-5)], 
-                                      dim=1).to(torch.uint8)
         
         if out_dtype is None:
             
             out_dtype = x.dtype
-        return pafs.to(out_dtype), ignore_mask
+        return pafs[:,:6].to(out_dtype),pafs[:,6:].to(out_dtype)
 
             
     def loss_all(self,
                     vector_field_y, 
                     vector_field_t,
+                    mask_y,
+                    mask_t,
                     groundpolygon, 
                     predictpolygon,
-                    ignore_mask,
                     lambda_offset=10.0,
                     lambda_target=10.0,
                     lambda_chamfer=1.0,
@@ -369,16 +362,38 @@ class TriView2CoordGrid(nn.Module):
         torch.cuda.synchronize(); t3 = time.time()
         print(f"Chamfer&IoU3D loss calculation time: {t3-t2:.4f}s")
         
-        loss_offset = lambda_offset*masked_mse_loss(vector_field_y[:, [0,1,2]], 
-                                                    vector_field_t[:, [0,1,2]],
-                                                    ignore_mask)
-        loss_target = lambda_target*masked_mse_loss(vector_field_y[:, [3,4,5]], 
-                                                    vector_field_t[:, [3,4,5]],
-                                                    ignore_mask)
-        loss_total = loss_offset + loss_target  +\
-        lambda_chamfer*torch.log(loss_chamfer) + lambda_3dIoU*loss_IoU3D
+        #offset
+        loss_offset,L_det_offset,L_vec_offset,L_neg_offset =\
+            loss_sparse_vector_field(mask_y[:,[0]], vector_field_y[:, [0,1,2]], 
+                                 mask_t[:,[0]], vector_field_t[:, [0,1,2]], 
+                             alpha=1.0, beta=0.2, lam_dir=1.0, 
+                             lam_mag=1.0, gamma=2.0, eps=1e-6)
+        #target
+        loss_target,L_det_target,L_vec_target,L_neg_target =\
+            loss_sparse_vector_field(mask_y[:,[1]], vector_field_y[:, [3,4,5]], 
+                                 mask_t[:,[1]], vector_field_t[:, [3,4,5]], 
+                             alpha=1.0, beta=0.2, lam_dir=1.0, 
+                             lam_mag=1.0, gamma=2.0, eps=1e-6)
+        
+        
 
-        return loss_total,loss_offset,loss_target,loss_chamfer, loss_IoU3D
+        loss_total = loss_offset + loss_target  
+        #+lambda_chamfer*torch.log(loss_chamfer) + lambda_3dIoU*loss_IoU3D
+
+        
+        
+        return loss_total,dict(loss_offset=loss_offset,
+                               loss_det_offset= L_det_offset,
+                               loss_vec_offset=L_vec_offset,
+                               loss_neg_offset=L_neg_offset,
+                        
+                               loss_target=loss_target,       
+                               loss_det_target= L_det_target,
+                               loss_vec_target=L_vec_target,
+                               loss_neg_target=L_neg_target,
+                               
+                               loss_chamfer=loss_chamfer, 
+                               loss_IoU3D=loss_IoU3D,)
 
 
 
@@ -439,31 +454,3 @@ def groups_as_list(rows: torch.Tensor):
     # convert to pure Python list-of-lists-of-ints
     groups = [rows_cpu[idxs].tolist() for idxs in groups_idx]
     return groups
-
-
-
-
-def create_mask_from_target(target_grid, eps=1e-6):
-    """
-    target_gridから有効ピクセルマスクを生成
-    
-    引数:
-        target_grid: ターゲット座標グリッド (B, H, W, 3)
-        eps: 浮動小数点誤差を考慮した閾値 (デフォルト: 1e-6)
-        
-    戻り値:
-        mask: 有効ピクセルを示すバイナリマスク (B, H, W)
-    """
-    # 1. 座標が無効値(0,0,0)かどうかを判定
-    zero_mask = torch.all(torch.abs(target_grid) < eps, dim=-1)
-    
-    # 2. NaN値のチェック
-    nan_mask = torch.isnan(target_grid).any(dim=-1)
-    
-    # 3. 無限大値のチェック
-    inf_mask = torch.isinf(target_grid).any(dim=-1)
-    
-    # 4. すべてのチェックを統合: 有効な座標 = ゼロでない AND NaNでない AND 無限大でない
-    valid_mask = ~(zero_mask | nan_mask | inf_mask)
-    
-    return valid_mask
