@@ -64,11 +64,11 @@ class YOLOx3D(nn.Module):
             # 凍結: coordinate3d（モニタ用に使っても更新しない）
 
         elif stage == 3:
-            # 凍結: backbone, classnet, meshnet
+            # 凍結: backbone, classnet
             freeze_module(self.backbone, True)
             freeze_module(self.classnet, True)
-            freeze_module(self.meshnet, True)
-            # 学習: coordinate3d
+            # 学習: meshnet,coordinate3d
+            unfreeze_module(self.meshnet, True)
             unfreeze_module(self.coordinate3d, True)
 
     def forward(self, x, targets=None):
@@ -100,15 +100,13 @@ class YOLOx3D(nn.Module):
                 total_loss = loss_2D+loss_class  
 
             else:  # self.stage == 3
-                # === Stage 3: Coordinate3D のみ学習
-                # MeshNetは出力だけもらう
-                pafs,features = self.meshnet(fpn0, targets["mesh"], 8)
-            
-                # TriView2CoordGridは学習対象
+                # === Stage 3: 
+                
+                loss_2D, loss_offset2D, loss_target2D, _,features = self.meshnet(fpn0, targets["mesh"], 8)
                 loss_3D, loss_dict = \
                     self.coordinate3d(features[-1], targets["mesh"], 8)
                 
-                total_loss = loss_3D  # 学習に使うのは3D系だけ
+                total_loss = loss_2D+loss_3D  # 学習に使うのは3D系だけ
                 outputs |= loss_dict
             outputs |= {
                 "total_loss": total_loss,

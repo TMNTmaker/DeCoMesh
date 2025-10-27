@@ -298,8 +298,8 @@ class Stage_1(nn.Module):
     def __init__(self):
         super(Stage_1, self).__init__()
         self.conv1_CPM_L1 = nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, stride=1, padding=1)
-        #self.conv2_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
-        #self.conv3_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
+        self.conv2_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
+        self.conv3_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
         self.conv4_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=1, stride=1, padding=0)
         self.conv5_CPM_L1 = nn.Conv2d(in_channels=256, out_channels=12, kernel_size=1, stride=1, padding=0)
         self.relu = nn.ReLU()
@@ -309,8 +309,8 @@ class Stage_1(nn.Module):
         
     def forward(self, x):
         h1 = self.relu(self.conv1_CPM_L1(x)) # branch1
-        #h1 = self.relu(self.conv2_CPM_L1(h1))
-        #h1 = self.relu(self.conv3_CPM_L1(h1))
+        h1 = self.relu(self.conv2_CPM_L1(h1))
+        h1 = self.relu(self.conv3_CPM_L1(h1))
         F1 = self.relu(self.conv4_CPM_L1(h1))
         h1 = self.conv5_CPM_L1(F1)
         h1 = self.softsign(self.bn(h1))
@@ -320,10 +320,10 @@ class Stage_x(nn.Module):
     def __init__(self):
         super(Stage_x, self).__init__()
         self.conv1_L1 = nn.Conv2d(in_channels = 268, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        #self.conv2_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        #self.conv3_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        #self.conv4_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        #self.conv5_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        self.conv2_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        self.conv3_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        self.conv4_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
+        self.conv5_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
         self.conv6_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 1, stride = 1, padding = 0)
         self.conv7_L1 = nn.Conv2d(in_channels = 128, out_channels = 12, kernel_size = 1, stride = 1, padding = 0)
         self.relu = nn.ReLU()
@@ -332,10 +332,10 @@ class Stage_x(nn.Module):
         
     def forward(self, x):
         h1 = self.relu(self.conv1_L1(x)) # branch1
-        #h1 = self.relu(self.conv2_L1(h1))
-        #h1 = self.relu(self.conv3_L1(h1))
-        #h1 = self.relu(self.conv4_L1(h1))
-        #h1 = self.relu(self.conv5_L1(h1))
+        h1 = self.relu(self.conv2_L1(h1))
+        h1 = self.relu(self.conv3_L1(h1))
+        h1 = self.relu(self.conv4_L1(h1))
+        h1 = self.relu(self.conv5_L1(h1))
         F1 = self.relu(self.conv6_L1(h1))
         h1 = self.conv7_L1(F1)
         h1 = self.softsign(self.bn(h1))

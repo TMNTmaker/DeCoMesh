@@ -17,25 +17,41 @@ class TripleViewEncoder(nn.Module):
         super().__init__()
         # 共有畳み込み層
         self.conv_shared = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3,stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3,stride=1, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
             )
         # ビュー別処理ブランチ
         self.conv_front = nn.Sequential(
-            nn.Conv2d(64, 128, 3, padding=1),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3,stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3,stride=1, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.MaxPool2d(2))
         
         self.conv_top = nn.Sequential(
-            nn.Conv2d(64, 128, 3, padding=1),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3,stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3,stride=1, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.MaxPool2d(2))
         
         self.conv_side = nn.Sequential(
-            nn.Conv2d(64, 128, 3, padding=1),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3,stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, 3,stride=1, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.MaxPool2d(2))
@@ -62,16 +78,34 @@ class LowRankVoxelFusion(nn.Module):
         assert self.out_channels % 8 == 0, "in_channels must be a multiple of 8"
         self.decoder_front = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
+            nn.ReLU(),
             nn.Conv2d(in_channels, self.out_channels, 3, padding=1),
             nn.BatchNorm2d(self.out_channels),
         )
         self.decoder_side = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
+            nn.ReLU(),
+            
             nn.Conv2d(in_channels, self.out_channels, 3, padding=1),
             nn.BatchNorm2d(self.out_channels),
         )
         self.decoder_top = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear'),
+            
+            nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
+            nn.ReLU(),
+            
             nn.Conv2d(in_channels, self.out_channels, 3, padding=1),
             nn.BatchNorm2d(self.out_channels),
         )
@@ -174,26 +208,6 @@ class TriView2CoordGrid(nn.Module):
         assert B_ == B
         # 事前に 26近傍の厚みテーブルを用意（半ボクセル単位: 0.5, √2/2, √3/2）
         import math
-        # しきい値カーネル（z,y,x）
-        sqrt3_2 = math.sqrt(3.0) * 0.5        # 0.866025403784...
-        sqrt2_2 = math.sqrt(2.0) * 0.5        # 0.707106781186...
-        demc2_2 = 0.5
-
-
-        th_kernel = torch.tensor([
-            [[sqrt3_2, sqrt2_2, sqrt3_2],
-            [sqrt2_2, demc2_2, sqrt2_2],
-            [sqrt3_2, sqrt2_2, sqrt3_2]],
-
-            [[sqrt2_2, demc2_2, sqrt2_2],
-            [demc2_2, demc2_2, demc2_2],
-            [sqrt2_2, demc2_2, sqrt2_2]],
-
-            [[sqrt3_2, sqrt2_2, sqrt3_2],
-            [sqrt2_2, demc2_2, sqrt2_2],
-            [sqrt3_2, sqrt2_2, sqrt3_2]],
-        ], device=device, dtype=torch.float32)#*0.75  # (3,3,3)
-
         def _k_smallest_mask(dist: torch.Tensor, k: int = 1) -> torch.Tensor:
             """
             dist: 任意形状（最後は空間格子）。全体の中から距離の小さい順に k 個だけ True。

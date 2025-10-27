@@ -397,7 +397,7 @@ def loss_sparse_vector_field(p_logit, v_pred, m_pos, v_gt,
     #)
 
     # 2) まず膨張（r=1）→ その結果をガウシアン拡散（σ=1.0）
-    Sm_pos = make_positive_targets(
+    m_pos = make_positive_targets(
         m_pos, method="both", radius=1, sigma=1.0, alpha_soft=1.0
     )
 
