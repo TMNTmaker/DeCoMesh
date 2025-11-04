@@ -154,7 +154,7 @@ class MeshNet(nn.Module):
                 for paf_xy, paf_yz, paf_zx in zip(pafs_xy, pafs_yz, pafs_zx)]
         features = [torch.cat([feat_xy, feat_yz, feat_zx], dim=1) 
                     for feat_xy, feat_yz, feat_zx in zip(features_xy, features_yz, features_zx)]
-        masks_y = [torch.cat([mask_xy, mask_yz, mask_zx], dim=1) 
+        masks_y = [torch.cat([mask_xy.unsqueeze(1), mask_yz.unsqueeze(1), mask_zx.unsqueeze(1)], dim=1) 
                    for mask_xy, mask_yz, mask_zx in zip(masks_xy, masks_yz, masks_zx)]
         if self.training:
             assert labels is not None, "labels must be provided during training"

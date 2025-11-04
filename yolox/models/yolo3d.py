@@ -72,8 +72,8 @@ class YOLOx3D(nn.Module):
             unfreeze_module(self.coordinate3d, True)
 
     def forward(self, x, targets=None):
-        fpn_outs = self.backbone(x)
-        fpn0 = fpn_outs[0]
+        features = self.backbone(x)
+        fpn0 = features[0]
         loss_class=loss_2D=loss_offset2D=loss_target2D=loss_3D=total_loss=torch.nan
         
         outputs = {

@@ -14,6 +14,7 @@ __all__ = ["Exp", "check_exp_value"]
 
 
 
+
 from typing import Any, List
 import torch
 import numpy as np
@@ -160,7 +161,7 @@ class Exp(BaseExp):
         self.nmsthre = 0.65
 
     def get_model(self):
-        from yolox.models import YOLOx3D, YOLOPAFPN, ClassNet,MeshNet, TriView2CoordGrid
+        from yolox.models import YOLOx3D, EfficientNetFPN, ClassNet,MeshNet, TriView2CoordGrid
         def init_yolo(M):
             for m in M.modules():
                 if isinstance(m, nn.BatchNorm2d):
@@ -168,8 +169,7 @@ class Exp(BaseExp):
                     m.momentum = 0.03
 
         if getattr(self, "model", None) is None:
-            #in_channels = [256, 512, 1024]
-            backbone = YOLOPAFPN(self.depth, self.width,in_channels = [256, 512, 1024], depthwise=True)
+            backbone = EfficientNetFPN()
             classnet = ClassNet(in_channels=256, hidden=256, num_classes=len(SUNRGBD_CLASSES_20), dropout_p=0.1)
             meshnet = MeshNet()
             coordinate3d = TriView2CoordGrid()
