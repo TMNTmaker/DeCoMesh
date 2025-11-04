@@ -9,7 +9,7 @@ from yolox.utils import (
 from typing import Tuple
 import time
 from yolox.models.losses import *
-
+import math
 
 class TripleViewEncoder(nn.Module):
     """三面図を処理するカスタムエンコーダ"""
@@ -17,56 +17,32 @@ class TripleViewEncoder(nn.Module):
         super().__init__()
         # 共有畳み込み層
         self.conv_shared = nn.Sequential(
-            nn.Conv2d(128, 128, 3, padding=1),
+            nn.Conv2d(384, 128, 3, padding=1),
             nn.ReLU(),
             nn.Conv2d(128, 128, 3,stride=1, padding=1),
             nn.ReLU(),
             nn.Conv2d(128, 128, 3,stride=1, padding=1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(num_groups=8, num_channels=128, eps=1e-5, affine=True),
             nn.ReLU(),
             )
         # ビュー別処理ブランチ
-        self.conv_front = nn.Sequential(
+        self.enc2d = nn.Sequential(
             nn.Conv2d(128, 128, 3, padding=1),
             nn.ReLU(),
             nn.Conv2d(128, 128, 3,stride=1, padding=1),
             nn.ReLU(),
             nn.Conv2d(128, 128, 3,stride=1, padding=1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(num_groups=8, num_channels=128, eps=1e-5, affine=True),
             nn.ReLU(),
             nn.MaxPool2d(2))
-        
-        self.conv_top = nn.Sequential(
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, 3,stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, 3,stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2))
-        
-        self.conv_side = nn.Sequential(
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, 3,stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, 3,stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2))
-        
+                
         
     def forward(self, x):
-                
-        #xf = self.conv_shared(x1)
-        #xs= self.conv_shared(x2)
-        #xt = self.conv_shared(x3)
         x = self.conv_shared(x)
         # ビュー別処理
-        front = self.conv_front(x)
-        side = self.conv_side(x)
-        top = self.conv_top(x)
+        front = self.enc2d(x)
+        side = self.enc2d(x)
+        top = self.enc2d(x)
         
         return front, top, side# (B, 128, H/4, W/4)
 
@@ -76,41 +52,34 @@ class LowRankVoxelFusion(nn.Module):
         super().__init__()
         self.out_channels = 216
         assert self.out_channels % 8 == 0, "in_channels must be a multiple of 8"
-        self.decoder_front = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.ReLU(),
-            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(in_channels, self.out_channels, 3, padding=1),
-            nn.BatchNorm2d(self.out_channels),
-        )
-        self.decoder_side = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.ReLU(),
-            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
-            nn.ReLU(),
-            
-            nn.Conv2d(in_channels, self.out_channels, 3, padding=1),
-            nn.BatchNorm2d(self.out_channels),
-        )
-        self.decoder_top = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            
-            nn.ReLU(),
-            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(in_channels, in_channels, 3,stride=1, padding=1),
-            nn.ReLU(),
-            
-            nn.Conv2d(in_channels, self.out_channels, 3, padding=1),
-            nn.BatchNorm2d(self.out_channels),
-        )
-        self.norm3d = nn.GroupNorm(num_groups=2, num_channels=8, eps=1e-5, affine=True)
+        
+                # 2Dデコーダ（BN2d→GN2dに置換推奨）
+        def dec2d():
+            return nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels, in_channels, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels, in_channels, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels, self.out_channels, 3, padding=1),
+                nn.GroupNorm(num_groups=8, num_channels=self.out_channels, eps=1e-5, affine=True),
+            )
+        self.decoder_front = dec2d()
+        self.decoder_side  = dec2d()
+        self.decoder_top   = dec2d()
+        
 
+
+        self.head3d = nn.Sequential(
+            nn.GroupNorm(num_groups=24, num_channels=72, eps=1e-5, affine=True),
+            nn.Conv3d(72, 32, kernel_size=1, bias=True),
+            nn.GroupNorm(num_groups=8, num_channels=32, eps=1e-5, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(32, 10, kernel_size=1, bias=True),  # [dir(3), mag(1), mask(1)]
+        )
+        self.softplus = nn.Softplus()
+        
         self.softsign = nn.Softsign()
     def forward(self, front,side,top):
         front = self.decoder_front(front)
@@ -120,15 +89,26 @@ class LowRankVoxelFusion(nn.Module):
         W,Z=side.shape[-2:]
         voxel = torch.einsum(
             'bcfxy, bcfyz, bcfzx -> bczyx',
-            front.view(-1, 8, self.out_channels//8, H, W),
-            side.view(-1, 8, self.out_channels//8, W, Z),
-            top.view(-1, 8, self.out_channels//8, Z, H),
-        ) / (self.out_channels/8)
+            front.view(-1, 72, self.out_channels//72, H, W),
+            side.view(-1, 72, self.out_channels//72, W, Z),
+            top.view(-1, 72, self.out_channels//72, Z, H),
+        ) / (self.out_channels/72)
+        head = self.head3d(voxel) # B, 10, D, H, W
+        dir_off_logit = head[:, 0:3]
+        mag_off_logit = head[:, 3:4]
+        dir_tgt_logit = head[:, 4:7]
+        mag_tgt_logit = head[:, 7:8]
+        mask_logit = head[:, 8:10]
+        # 方向を単位化、マグはsoftplus→実スケール
+        v_off_dir = dir_off_logit / (dir_off_logit.norm(dim=1, keepdim=True).clamp_min(1e-8))
+        v_off_mag = self.softplus(mag_off_logit)
+        v_pred_off = v_off_dir * v_off_mag
         
-        voxel = self.norm3d(voxel)
-        
-        offtgt=self.softsign(voxel[:,:6])
-        mask_logit = voxel[:,6:]
+        v_tgt_dir = dir_tgt_logit / (dir_tgt_logit.norm(dim=1, keepdim=True).clamp_min(1e-8))
+        v_tgt_mag = self.softplus(mag_tgt_logit)
+        v_pred_tgt = v_tgt_dir * v_tgt_mag
+        # 結合
+        offtgt = torch.cat([v_pred_off, v_pred_tgt], dim= 1)  # B, 6, D, H, W
         return  offtgt,mask_logit
 
 class TriView2CoordGrid(nn.Module):
@@ -150,9 +130,9 @@ class TriView2CoordGrid(nn.Module):
             
             joint_list = labels
             torch.cuda.synchronize(); t0 = time.time()    
-            vector_field_t,mask_t= self.data_procces_torch(vector_field_y,joint_list,reduction_mag)
+            vector_field_t,mask_t= self.data_process_torch(vector_field_y,joint_list,reduction_mag)
             torch.cuda.synchronize(); t1 = time.time()
-            print(f"Label grid build time: {t1-t0:.4f}s")            
+            #print(f"Label grid build time: {t1-t0:.4f}s")            
             
             
             torch.cuda.synchronize(); t0 = time.time()
@@ -162,7 +142,7 @@ class TriView2CoordGrid(nn.Module):
             predictpolygon = postprocess3D(vector_field_y,
                             reduction_mag)
             torch.cuda.synchronize(); t2 = time.time()
-            print(f"Ground polygon processing time: {t1-t0:.4f}s  Predict polygon processing time: {t2-t1:.4f}s")
+            #print(f"Ground polygon processing time: {t1-t0:.4f}s  Predict polygon processing time: {t2-t1:.4f}s")
 
             
             loss,loss_dict=\
@@ -183,14 +163,13 @@ class TriView2CoordGrid(nn.Module):
     
     
     @torch.no_grad()
-    def data_procces_torch(
+    def data_process_torch(
         self,
         x: torch.Tensor,  
         joint_list: torch.Tensor,        # [B, N, F, 4, 3]  四角形x(x,y,z)
         reduction_mag: float,
         out_dtype: torch.dtype | None = None,
-    ) -> Tuple [torch.Tensor , torch.Tensor]:
-        
+    ) -> Tuple [torch.Tensor , torch.Tensor]:        
         """
         Returns:
             pafs: (B, 8, D, H, W)[off_mask, off_z, off_y, off_x, off_mask, tgt_z, tgt_y, tgt_x]  
@@ -207,7 +186,7 @@ class TriView2CoordGrid(nn.Module):
         B_, N, F, _, _ = jl.shape
         assert B_ == B
         # 事前に 26近傍の厚みテーブルを用意（半ボクセル単位: 0.5, √2/2, √3/2）
-        import math
+        
         def _k_smallest_mask(dist: torch.Tensor, k: int = 1) -> torch.Tensor:
             """
             dist: 任意形状（最後は空間格子）。全体の中から距離の小さい順に k 個だけ True。
@@ -374,7 +353,7 @@ class TriView2CoordGrid(nn.Module):
         loss_chamfer = chamfer_distance(predictpolygon, groundpolygon)
         _,loss_IoU3D = IoU3D_voxel(predictpolygon, groundpolygon)
         torch.cuda.synchronize(); t3 = time.time()
-        print(f"Chamfer&IoU3D loss calculation time: {t3-t2:.4f}s")
+        #print(f"Chamfer&IoU3D loss calculation time: {t3-t2:.4f}s")
         
         #offset
         loss_offset,L_det_offset,L_vec_offset,L_neg_offset =\

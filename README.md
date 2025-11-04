@@ -4,7 +4,7 @@ tensorboard --logdir  YOLOX_outputs/yolox3D_base/tensorboard/
 
 mv YOLOX_outputs/yolox3D_base/tensorboard/ YOLOX_outputs/yolox3D_base/tensorboard_mmdd_n/
 
-sudo rm -rf YOLOX_outputs/yolox3D_base/tensorboard/
+sudo rm -rf YOLOX_outputs/yolox3D_base/tensorboard/ 
 ```
 
 

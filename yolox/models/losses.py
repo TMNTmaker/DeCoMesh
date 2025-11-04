@@ -342,96 +342,129 @@ def make_positive_targets(
         tgt = tgt * (~ignore_mask).float()
     return tgt.clamp_(0.0, 1.0)
 
-def focal_bce_with_logits(
-    logits,              # (B,1,D,H,W)
-    target,              # (B,1,D,H,W) in [0,1]  ソフトGT可
-    gamma: float = 2.0,
-    alpha: float = 0.25,
-    ignore_mask=None,    # (B,1,D,H,W) bool, True=無視
-    eps: float = 1e-6,
-):
-    # 1) BCE (logit版, 安定)
-    bce = torch.nn.functional.binary_cross_entropy_with_logits(
-        logits, target, reduction='none'
-    )
 
-    # 2) p, p_t, alpha_t
+
+# ---- 有効平均（サンプル単位で平均。正例0のサンプルは除外） ----
+def masked_batch_mean(loss_map: torch.Tensor, mask_bool: torch.Tensor):
+    # loss_map, mask_bool: (B, D, H, W)
+    B = loss_map.shape[0]
+    vals = []
+    for b in range(B):
+        m = mask_bool[b]
+        if m.any():
+            vals.append(loss_map[b][m].mean())
+    if len(vals) == 0:
+        return None  # 勾配を薄めないため None を返す
+    return torch.stack(vals).mean()
+
+# ---- 角度Huberのマップ版（±対称対応） ----
+def angular_huber_map(v_pred, v_gt, delta=0.2, symmetric=False, eps=1e-8):
+    # v_pred/v_gt: (B,3,D,H,W) -> (B,D,H,W)
+    vp = v_pred / (v_pred.norm(dim=1, keepdim=True).clamp_min(eps))
+    vg = v_gt   / (v_gt.norm(dim=1, keepdim=True).clamp_min(eps))
+    cos = (vp*vg).sum(1, keepdim=True).clamp(-1+1e-6, 1-1e-6)
+    if symmetric:
+        cos = cos.abs()
+    theta = torch.acos(cos).squeeze(1)  # (B,D,H,W)
+    return torch.where(theta <= delta, 0.5*(theta**2)/delta, theta-0.5*delta)
+
+# ---- Focal-BCE（logit版） ----
+def focal_bce_with_logits(logits, target, gamma=2.0, alpha=0.25, ignore_mask=None):
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
     p = torch.sigmoid(logits)
-    p_t = target * p + (1 - target) * (1 - p)          # soft label 対応
-    alpha_t = target * alpha + (1 - target) * (1 - alpha)
-
-    # 3) focal 係数
+    p_t = target*p + (1-target)*(1-p)
+    alpha_t = target*alpha + (1-target)*(1-alpha)
     focal_factor = (1.0 - p_t).clamp(min=0.0).pow(gamma)
-
-    # 4) 無視マスク
-    if ignore_mask is not None:
-        w = (~ignore_mask).to(bce.dtype)
-    else:
-        w = torch.ones_like(bce)
-
+    w = torch.ones_like(bce) if ignore_mask is None else (~ignore_mask).to(bce.dtype)
     loss = w * alpha_t * focal_factor * bce
-
-    # 5) 正規化（有効画素で割る）
     denom = w.sum().clamp_min(1.0)
     return loss.sum() / denom
 
-def loss_sparse_vector_field(p_logit, v_pred, m_pos, v_gt, 
-                             alpha=1.0, beta=0.2, lam_dir=1.0, lam_mag=1.0, gamma=2.0, eps=1e-6):
+# ---- 正例拡張（あなたの make_positive_targets を使用） ----
+# ここでは検出用の soft target を作る。回帰は別マスクを作る。
+
+def loss_sparse_vector_field(
+    p_logit, v_pred, m_pos_hard, v_gt,
+    alpha=1.0, beta=0.2, lam_dir=1.0, lam_mag=1.0,
+    gamma=2.0, eps=1e-6, tau=1e-2, symmetric=False,
+    use_topk_neg: float | None = None  # 例: 0.1 で負例上位10%のみ
+):
     """
-    p_logit: (B,1,D,H,W), v_pred/v_gt: (B,3,D,H,W), m_pos∈{0,1}
+    p_logit: (B,1,D,H,W)
+    v_pred: (B,3,D,H,W)
+    m_pos_hard: (B,1,D,H,W) 0/1（回帰では hard を基に使う）
+    v_gt: (B,3,D,H,W)
     """
-    # 1) 検出: Focal BCE
-    #p = torch.sigmoid(p_logit)
-    #pt = torch.where(m_pos.detach()>0, p, 1-p)
-    #alpha_focal = 0.25
-    ## クラスごとの alpha を適用する例（任意）
-    #alpha_t = torch.where(m_pos.detach() > 0, alpha_focal, 1.0 - alpha_focal)
-    #focal = -alpha_t * (1 - pt).pow(gamma) * torch.log(pt.clamp_min(1e-6))
-    ## focal = -alpha_focal*(1-pt).pow(gamma)*torch.log(pt.clamp_min(1e-6))
-    #L_det = focal.mean()
-    
-    
-    # 1) ガウシアン拡散だけ（σ=1.0）
-    #m_pos = make_positive_targets(
-    #    m_pos, method="gaussian", sigma=1.0, alpha_soft=1.0
-    #)
+    B = v_pred.shape[0]
 
-    # 2) まず膨張（r=1）→ その結果をガウシアン拡散（σ=1.0）
-    m_pos = make_positive_targets(
-        m_pos, method="both", radius=1, sigma=1.0, alpha_soft=1.0
-    )
+    # 1) 検出用の soft target（膨張→ガウシアン）
+    m_pos_soft = make_positive_targets(
+        m_pos_hard, method="both", radius=1, sigma=1.0, alpha_soft=1.0
+    )  # (B,1,D,H,W), [0,1]
 
-
-
-    
     L_det = focal_bce_with_logits(
-    p_logit,                # logits
-    m_pos,             # 0/1でもソフトでもOK
-    gamma=gamma,
-    alpha=0.1,
-    ignore_mask=None,  # あれば渡す
+        p_logit, m_pos_soft, gamma=gamma, alpha=0.25, ignore_mask=None
     )
-    
-    
-    
-    # 2) 回帰（正例のみ）
-    # 方向 loss
-    v_gt_norm = v_gt.norm(dim=1, keepdim=True).clamp_min(eps)
-    v_pred_norm = v_pred.norm(dim=1, keepdim=True).clamp_min(eps)
-    cos_sim = (v_pred * v_gt).sum(1, keepdim=True) / (v_pred_norm * v_gt_norm)
-    L_dir = (1.0 - cos_sim.clamp(-1,1)).squeeze(1)  # (B,D,H,W)
 
-    # 大きさ loss
-    L_mag = torch.nn.functional.smooth_l1_loss(v_pred_norm, v_gt_norm, reduction='none').squeeze(1)
+    # 2) 回帰（GTマスク基準）。小ノルムGTは方向未定義なので除外
+    v_gt_norm  = v_gt.norm(dim=1, keepdim=True)                    # (B,1,D,H,W)
+    v_pred_norm = v_pred.norm(dim=1, keepdim=True).clamp_min(eps)  # (B,1,D,H,W)
 
-    L_vec = (lam_dir*L_dir + lam_mag*L_mag)
-    L_vec = (L_vec * m_pos).sum() / (m_pos.sum().clamp_min(1.0))
+    # 回帰用マスク: hard正例 & |v_gt|>tau （方向） / hard正例（大きさ）
+    m_reg_dir = ((m_pos_hard > 0) & (v_gt_norm > tau)).squeeze(1)  # (B,D,H,W)
+    m_reg_mag = (m_pos_hard > 0).squeeze(1)                        # (B,D,H,W)
 
-    # 3) 負例抑制（focal-MSE）
-    w_neg = (v_pred_norm.squeeze(1)).pow(gamma)  # 大きい外れだけ罰する
-    L_neg = ((1 - m_pos) * w_neg * (v_pred**2).sum(1)).sum() / ((1 - m_pos).sum().clamp_min(1.0))
+    # 方向: 角度Huber（±対称タスクなら symmetric=True）
+    ang_map = angular_huber_map(v_pred, v_gt, delta=0.2, symmetric=symmetric, eps=eps)  # (B,D,H,W)
+    L_dir = masked_batch_mean(ang_map, m_reg_dir)
 
-    return L_det + alpha*L_vec + beta*L_neg, L_det,L_vec,L_neg
+    # 大きさ: log域 L1（ロバスト）
+    mag_map = (torch.abs(torch.log(v_pred_norm.clamp_min(eps)) - torch.log(v_gt_norm.clamp_min(eps)))).squeeze(1)
+    L_mag = masked_batch_mean(mag_map, m_reg_mag)
+
+    # 有効サンプルが無いバッチに備える
+    if L_dir is None and L_mag is None:
+        L_vec = torch.tensor(0.0, device=v_pred.device, dtype=v_pred.dtype, requires_grad=True)
+    elif L_dir is None:
+        L_vec = lam_mag * L_mag
+    elif L_mag is None:
+        L_vec = lam_dir * L_dir
+    else:
+        L_vec = lam_dir * L_dir + lam_mag * L_mag
+
+    # 3) 負例抑制（negのみ）。必要なら Top-k で間引き
+    neg_mask = (~(m_pos_hard > 0)).squeeze(1)  # (B,D,H,W)
+    neg_map = (v_pred.pow(2).sum(1))  # (B,D,H,W) = ||v_pred||^2
+    weight = v_pred_norm.squeeze(1).pow(gamma) # 大きい外れを強調
+
+    neg_loss_map = weight * neg_map  # (B,D,H,W)
+    if use_topk_neg is not None and 0 < use_topk_neg < 1:
+        # 各サンプルで上位k%だけ残す
+        topk_mask = torch.zeros_like(neg_mask)
+        K = int(neg_mask[0].numel() * use_topk_neg)
+        K = max(1, K)
+        for b in range(B):
+            cand = neg_loss_map[b][neg_mask[b]]
+            if cand.numel() == 0:
+                continue
+            vals, idx = torch.topk(cand, min(K, cand.numel()))
+            flat = torch.zeros_like(neg_mask[b], dtype=torch.bool)
+            flat[neg_mask[b]] = False
+            # 上位K番目までを True にするマスクを作る
+            flat_indices = torch.nonzero(neg_mask[b], as_tuple=False).squeeze(1)
+            flat[flat_indices[idx]] = True
+            topk_mask[b] = flat
+        neg_eff_mask = topk_mask
+    else:
+        neg_eff_mask = neg_mask
+
+    L_neg = masked_batch_mean(neg_loss_map, neg_eff_mask)
+    if L_neg is None:
+        L_neg = torch.tensor(0.0, device=v_pred.device, dtype=v_pred.dtype, requires_grad=True)
+
+    L_total = L_det + alpha * L_vec + beta * L_neg
+    return L_total, L_det, L_vec, L_neg
+
 
 
 TensorLike = Union[torch.Tensor, List, torch.Tensor]

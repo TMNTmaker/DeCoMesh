@@ -126,13 +126,13 @@ class Exp(BaseExp):
         self.warmup_lr = 0
         self.min_lr_ratio = 0.05
         # learning rate for one image. During training, lr will multiply batchsize.
-        self.basic_lr_per_img = 1e-4
+        self.basic_lr_per_img = 1e-5
         # name of LRScheduler
         self.scheduler = "yoloxwarmcos"
         # last #epoch to close augmention like mosaic
         self.no_aug_epochs = 15
         # apply EMA during training
-        self.ema = True
+        self.ema = False
 
         # weight decay of optimizer
         self.weight_decay = 5e-4
@@ -336,7 +336,10 @@ class Exp(BaseExp):
                 elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
                     pg1.append(v.weight)  # decay
 
-            optimizer = torch.optim.SGD(pg0, lr=lr, momentum=self.momentum, nesterov=True)
+            # Use AdamW optimizer for adaptive learning rates and decoupled weight decay
+            # (replaces previous SGD). We keep param groups so weight decay is applied
+            # only to the intended parameters (pg1).
+            optimizer = torch.optim.AdamW(pg0, lr=lr, betas=(0.9, 0.999), eps=1e-8)
             optimizer.add_param_group({"params": pg1, "weight_decay": self.weight_decay})
             optimizer.add_param_group({"params": pg2})
             self.optimizer = optimizer
