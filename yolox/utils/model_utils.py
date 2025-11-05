@@ -178,7 +178,7 @@ def freeze_module_unit(module: nn.Module, name=None) -> nn.Module:
 
 
 @contextlib.contextmanager
-def adjust_status(module: nn.Module, training: bool = False) -> nn.Module:
+def adjust_status(module: nn.Module, training: bool = False):
     """Adjust module to training/eval mode temporarily.
 
     Args:

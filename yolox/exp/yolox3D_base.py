@@ -92,9 +92,9 @@ class Exp(BaseExp):
         # dir of dataset images, if data_dir is None, this project will use `datasets` dir
         self.data_dir = "datasets"
         # name of annotation file for training
-        self.train_ann = "train_anno.json"
+        self.train_ann = "train_anno_10.json" # "train_anno.json"
         # name of annotation file for evaluation
-        self.val_ann = "test_anno.json"
+        self.val_ann = "test_anno_10.json" # "test_anno.json"
         # name of annotation file for testing
         #self.test_ann = "instances_test2017.json"
 

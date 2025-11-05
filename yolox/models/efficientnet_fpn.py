@@ -49,7 +49,7 @@ class EfficientNetFPN(nn.Module):
         # になることが多いのでこれをC3/C4/C5にする
         c3 = endpoints["reduction_3"]
         c4 = endpoints["reduction_4"]
-        c5 = endpoints["reduction_5"]
+        c5 = endpoints["reduction_6"]
 
         # lateralでchそろえ
         p5 = self._get_lateral("p5", c5.shape[1])(c5)
@@ -67,3 +67,32 @@ class EfficientNetFPN(nn.Module):
 
         return [p3]
         #return p5,p4,p3
+
+
+
+
+
+class EfficientNetEXP(nn.Module):
+    def __init__(self, model_name="efficientnet-b2", pretrained=True, out_channels=88):
+        super().__init__()
+        if pretrained:
+            self.backbone = EfficientNet.from_pretrained(model_name)
+        else:
+            self.backbone = EfficientNet.from_name(model_name)
+
+        # extract_features が返す最終特徴のch数をとる
+        in_channels = self.backbone._conv_head.out_channels  # b2なら1408とか
+
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        # ここで EfficientNet の最終特徴を一発で取れる
+        feat = self.backbone.extract_features(x)   # [B, C, 20, 20] 想定
+
+        # 80x80 に拡大
+        feat = F.interpolate(feat, size=(80, 80), mode="bilinear", align_corners=False)
+
+        # チャネルを88に
+        feat = self.proj(feat)
+
+        return [feat]
