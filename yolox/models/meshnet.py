@@ -4,16 +4,29 @@ from yolox.models.losses import *
 import time
 from typing import Tuple
 
+
+
+
+
 class Stage_1(nn.Module):
-    def __init__(self):
+    def __init__(self,sep=False,learn_uv=False,chanel_scale=1):
         super(Stage_1, self).__init__()
-        self.conv1_CPM_L1 = nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, stride=1, padding=1)
-        self.conv2_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
-        self.conv3_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1)
-        self.conv4_CPM_L1 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=1, stride=1, padding=0)
-        self.conv5_CPM_L1 = nn.Conv2d(in_channels=256, out_channels=7, kernel_size=1, stride=1, padding=0)
+        self.sep=sep
+        self.learn_uv=learn_uv
+        self.chanel_scale=chanel_scale
+        
+        chn1 = 256
+        chn2 = int(128*self.chanel_scale)
+        chn3 = int(256*self.chanel_scale)
+        out_chn = 7 if self.learn_uv else 5
+        out_chn = out_chn*3 if not self.sep else out_chn
+
+        self.conv1_CPM_L1 = nn.Conv2d(in_channels=chn1, out_channels=chn2, kernel_size=3, stride=1, padding=1)
+        self.conv2_CPM_L1 = nn.Conv2d(in_channels=chn2, out_channels=chn2, kernel_size=3, stride=1, padding=1)
+        self.conv3_CPM_L1 = nn.Conv2d(in_channels=chn2, out_channels=chn2, kernel_size=3, stride=1, padding=1)
+        self.conv4_CPM_L1 = nn.Conv2d(in_channels=chn2, out_channels=chn3, kernel_size=1, stride=1, padding=0)
+        self.conv5_CPM_L1 = nn.Conv2d(in_channels=chn3, out_channels=out_chn, kernel_size=1, stride=1, padding=0)
         self.relu = nn.ReLU()
-        self.bn   = nn.BatchNorm2d(num_features=7)
         self.softsign = nn.Softsign()
         self.softplus = nn.Softplus()
         
@@ -22,37 +35,102 @@ class Stage_1(nn.Module):
         h1 = self.relu(self.conv2_CPM_L1(h1))
         h1 = self.relu(self.conv3_CPM_L1(h1))
         F1 = self.relu(self.conv4_CPM_L1(h1))
-        h1 = self.bn(self.conv5_CPM_L1(F1))
-        dir_off_logit = h1[:,0:2]
-        mag_off_logit = h1[:,2:3]
-        dir_tgt_logit = h1[:,3:5]
-        mag_tgt_logit = h1[:,5:6]
-        m = h1[:,6]  # mask logits
+        h1 = self.conv5_CPM_L1(F1)
+
         
-        v_off_dir = dir_off_logit / (dir_off_logit.norm(dim=1, keepdim=True).clamp_min(1e-8))
-        v_off_mag = self.softplus(mag_off_logit)
-        v_pred_off = v_off_dir * v_off_mag
+        if self.learn_uv and self.sep:
+            dir_off_logit = h1[:,0:2]
+            mag_off_logit = h1[:,2:3]
+            dir_tgt_logit = h1[:,3:5]
+            mag_tgt_logit = h1[:,5:6]
+            m = h1[:,6]  # mask logits
+            
+            v_off_dir = dir_off_logit / (dir_off_logit.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_off_mag = self.softplus(mag_off_logit)
+            v_pred_off = v_off_dir * v_off_mag
+            
+            v_tgt_dir = dir_tgt_logit / (dir_tgt_logit.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_tgt_mag = self.softplus(mag_tgt_logit)        
+            v_pred_tgt = v_tgt_dir * v_tgt_mag       
+            # 結合
+            h1 = torch.cat([v_pred_off, v_pred_tgt], dim= 1)  # B, 4, H, W
+
+        elif self.learn_uv and not self.sep:
+            dir_off_logit_xy = h1[:,0:2]
+            mag_off_logit_xy = h1[:,2]
+            dir_tgt_logit_xy = h1[:,3:5]
+            mag_tgt_logit_xy = h1[:,5]
+            
+            dir_off_logit_yz = h1[:,6:8]
+            mag_off_logit_yz = h1[:,8]
+            dir_tgt_logit_yz = h1[:,9:11]
+            mag_tgt_logit_yz = h1[:,11]
+            
+            dir_off_logit_zx = h1[:,12:14]
+            mag_off_logit_zx = h1[:,14]
+            dir_tgt_logit_zx = h1[:,15:17]
+            mag_tgt_logit_zx = h1[:,17]
+            
+            m = h1[:,18:21]  # mask logits
+            
+            v_off_dir_xy = dir_off_logit_xy / (dir_off_logit_xy.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_off_mag_xy = self.softplus(mag_off_logit_xy)
+            v_pred_off_xy = v_off_dir_xy * v_off_mag_xy
+            
+            v_tgt_dir_xy = dir_tgt_logit_xy / (dir_tgt_logit_xy.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_tgt_mag_xy = self.softplus(mag_tgt_logit_xy)        
+            v_pred_tgt_xy = v_tgt_dir_xy * v_tgt_mag_xy       
+            
+            v_off_dir_yz = dir_off_logit_yz / (dir_off_logit_yz.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_off_mag_yz = self.softplus(mag_off_logit_yz)
+            v_pred_off_yz = v_off_dir_yz * v_off_mag_yz
+            
+            v_tgt_dir_yz = dir_tgt_logit_yz / (dir_tgt_logit_yz.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_tgt_mag_yz = self.softplus(mag_tgt_logit_yz)        
+            v_pred_tgt_yz = v_tgt_dir_yz * v_tgt_mag_yz       
+            
+            v_off_dir_zx = dir_off_logit_zx / (dir_off_logit_zx.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_off_mag_zx = self.softplus(mag_off_logit_zx)
+            v_pred_off_zx = v_off_dir_zx * v_off_mag_zx
+            
+            v_tgt_dir_zx = dir_tgt_logit_zx / (dir_tgt_logit_zx.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_tgt_mag_zx = self.softplus(mag_tgt_logit_zx)        
+            v_pred_tgt_zx = v_tgt_dir_zx * v_tgt_mag_zx       
+            # 結合
+            h1 = torch.cat([v_pred_off_xy, v_pred_tgt_xy,
+                            v_pred_off_yz, v_pred_tgt_yz,
+                            v_pred_off_zx, v_pred_tgt_zx], dim= 1)  # B, 12, H, W
+
+        elif not self.learn_uv and self.sep:
+            h1 = self.softsign(h1[:,0:4]) # off_y, off_x, tgt_y, tgt_x
+            m = h1[:,4]  # mask logits  
+                        
         
-        v_tgt_dir = dir_tgt_logit / (dir_tgt_logit.norm(dim=1, keepdim=True).clamp_min(1e-8))
-        v_tgt_mag = self.softplus(mag_tgt_logit)        
-        v_pred_tgt = v_tgt_dir * v_tgt_mag       
-        # 結合
-        h1 = torch.cat([v_pred_off, v_pred_tgt], dim= 1)  # B, 4, H, W
-        
+        elif not self.learn_uv and not self.sep:
+            h1 = self.softsign(h1[:,0:12]) 
+            m = h1[:,12:14]  # mask logits
         return h1,F1,m
     
 class Stage_x(nn.Module):
-    def __init__(self):
+    def __init__(self,sep=False,learn_uv=False,chanel_scale=1):
         super(Stage_x, self).__init__()
-        self.conv1_L1 = nn.Conv2d(in_channels = 260, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        self.conv2_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        self.conv3_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        self.conv4_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        self.conv5_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 7, stride = 1, padding = 3)
-        self.conv6_L1 = nn.Conv2d(in_channels = 128, out_channels = 128, kernel_size = 1, stride = 1, padding = 0)
-        self.conv7_L1 = nn.Conv2d(in_channels = 128, out_channels = 7, kernel_size = 1, stride = 1, padding = 0)
+        self.sep=sep
+        self.learn_uv=learn_uv
+        self.chanel_scale=chanel_scale
+        chn1 = 256+4
+        chn2 = int(128*self.chanel_scale)
+
+        out_chn = 7 if self.learn_uv else 5
+        out_chn = out_chn*3 if not self.sep else out_chn
+
+        self.conv1_L1 = nn.Conv2d(in_channels = chn1, out_channels = chn2, kernel_size = 7, stride = 1, padding = 3)
+        self.conv2_L1 = nn.Conv2d(in_channels = chn2, out_channels = chn2, kernel_size = 7, stride = 1, padding = 3)
+        self.conv3_L1 = nn.Conv2d(in_channels = chn2, out_channels = chn2, kernel_size = 7, stride = 1, padding = 3)
+        self.conv4_L1 = nn.Conv2d(in_channels = chn2, out_channels = chn2, kernel_size = 7, stride = 1, padding = 3)
+        self.conv5_L1 = nn.Conv2d(in_channels = chn2, out_channels = chn2, kernel_size = 7, stride = 1, padding = 3)
+        self.conv6_L1 = nn.Conv2d(in_channels = chn2, out_channels = chn2, kernel_size = 1, stride = 1, padding = 0)
+        self.conv7_L1 = nn.Conv2d(in_channels = chn2, out_channels = out_chn, kernel_size = 1, stride = 1, padding = 0)
         self.relu = nn.ReLU()
-        self.bn   = nn.BatchNorm2d(num_features=7)
         self.softsign = nn.Softsign()
         self.softplus = nn.Softplus()
         
@@ -63,99 +141,189 @@ class Stage_x(nn.Module):
         h1 = self.relu(self.conv4_L1(h1))
         h1 = self.relu(self.conv5_L1(h1))
         F1 = self.relu(self.conv6_L1(h1))
-        h1 = self.bn(self.conv7_L1(F1))
-        dir_off_logit = h1[:,0:2]
-        mag_off_logit = h1[:,2:3]
-        dir_tgt_logit = h1[:,3:5]
-        mag_tgt_logit = h1[:,5:6]
-        m = h1[:,6]  # mask logits
+        h1 = self.conv7_L1(F1)
         
-        v_off_dir = dir_off_logit / (dir_off_logit.norm(dim=1, keepdim=True).clamp_min(1e-8))
-        v_off_mag = self.softplus(mag_off_logit)
-        v_pred_off = v_off_dir * v_off_mag
-        
-        v_tgt_dir = dir_tgt_logit / (dir_tgt_logit.norm(dim=1, keepdim=True).clamp_min(1e-8))
-        v_tgt_mag = self.softplus(mag_tgt_logit)        
-        v_pred_tgt = v_tgt_dir * v_tgt_mag       
-        # 結合
-        h1 = torch.cat([v_pred_off, v_pred_tgt], dim= 1)  # B, 4, H, W
-        return h1,F1,m
+        if self.learn_uv and self.sep:
+            dir_off_logit = h1[:,0:2]
+            mag_off_logit = h1[:,2:3]
+            dir_tgt_logit = h1[:,3:5]
+            mag_tgt_logit = h1[:,5:6]
+            m = h1[:,6]  # mask logits
+            
+            v_off_dir = dir_off_logit / (dir_off_logit.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_off_mag = self.softplus(mag_off_logit)
+            v_pred_off = v_off_dir * v_off_mag
+            
+            v_tgt_dir = dir_tgt_logit / (dir_tgt_logit.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_tgt_mag = self.softplus(mag_tgt_logit)        
+            v_pred_tgt = v_tgt_dir * v_tgt_mag       
+            # 結合
+            h1 = torch.cat([v_pred_off, v_pred_tgt], dim= 1)  # B, 4, H, W
 
+        elif self.learn_uv and not self.sep:
+            dir_off_logit_xy = h1[:,0:2]
+            mag_off_logit_xy = h1[:,2]
+            dir_tgt_logit_xy = h1[:,3:5]
+            mag_tgt_logit_xy = h1[:,5]
+            
+            dir_off_logit_yz = h1[:,6:8]
+            mag_off_logit_yz = h1[:,8]
+            dir_tgt_logit_yz = h1[:,9:11]
+            mag_tgt_logit_yz = h1[:,11]
+            
+            dir_off_logit_zx = h1[:,12:14]
+            mag_off_logit_zx = h1[:,14]
+            dir_tgt_logit_zx = h1[:,15:17]
+            mag_tgt_logit_zx = h1[:,17]
+            
+            m = h1[:,18:21]  # mask logits
+            
+            v_off_dir_xy = dir_off_logit_xy / (dir_off_logit_xy.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_off_mag_xy = self.softplus(mag_off_logit_xy)
+            v_pred_off_xy = v_off_dir_xy * v_off_mag_xy
+            
+            v_tgt_dir_xy = dir_tgt_logit_xy / (dir_tgt_logit_xy.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_tgt_mag_xy = self.softplus(mag_tgt_logit_xy)        
+            v_pred_tgt_xy = v_tgt_dir_xy * v_tgt_mag_xy       
+            
+            v_off_dir_yz = dir_off_logit_yz / (dir_off_logit_yz.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_off_mag_yz = self.softplus(mag_off_logit_yz)
+            v_pred_off_yz = v_off_dir_yz * v_off_mag_yz
+            
+            v_tgt_dir_yz = dir_tgt_logit_yz / (dir_tgt_logit_yz.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_tgt_mag_yz = self.softplus(mag_tgt_logit_yz)        
+            v_pred_tgt_yz = v_tgt_dir_yz * v_tgt_mag_yz       
+            
+            v_off_dir_zx = dir_off_logit_zx / (dir_off_logit_zx.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_off_mag_zx = self.softplus(mag_off_logit_zx)
+            v_pred_off_zx = v_off_dir_zx * v_off_mag_zx
+            
+            v_tgt_dir_zx = dir_tgt_logit_zx / (dir_tgt_logit_zx.norm(dim=1, keepdim=True).clamp_min(1e-8))
+            v_tgt_mag_zx = self.softplus(mag_tgt_logit_zx)        
+            v_pred_tgt_zx = v_tgt_dir_zx * v_tgt_mag_zx       
+            # 結合
+            h1 = torch.cat([v_pred_off_xy, v_pred_tgt_xy,
+                            v_pred_off_yz, v_pred_tgt_yz,
+                            v_pred_off_zx, v_pred_tgt_zx], dim= 1)  # B, 12, H, W
+
+        elif not self.learn_uv and self.sep:
+            h1 = self.softsign(h1[:,0:4]) # off_y, off_x, tgt_y, tgt_x
+            m = h1[:,4]  # mask logits  
+                        
+        
+        elif not self.learn_uv and not self.sep:
+            h1 = self.softsign(h1[:,0:12]) 
+            m = h1[:,12:14]  # mask logits
+        return h1,F1,m
+    
 class MeshNet(nn.Module):
-    def __init__(self):
+    def __init__(self,sep=True,learn_uv=True,chanel_scale=1):
         super().__init__()
-        # xyビュー用のステージ
-        self.stage_1_xy = Stage_1()
-        self.stage_2_xy = Stage_x()
-        self.stage_3_xy = Stage_x()
-        self.stage_4_xy = Stage_x()
-        self.stage_5_xy = Stage_x()
-        self.stage_6_xy = Stage_x()
+        self.sep=sep
+        self.learn_uv=learn_uv
+        self.chanel_scale=chanel_scale
         
-        # yzビュー用のステージ
-        self.stage_1_yz = Stage_1()
-        self.stage_2_yz = Stage_x()
-        self.stage_3_yz = Stage_x()
-        self.stage_4_yz = Stage_x()
-        self.stage_5_yz = Stage_x()
-        self.stage_6_yz = Stage_x()
-        
-        # zxビュー用のステージ
-        self.stage_1_zx = Stage_1()
-        self.stage_2_zx = Stage_x()
-        self.stage_3_zx = Stage_x()
-        self.stage_4_zx = Stage_x()
-        self.stage_5_zx = Stage_x()
-        self.stage_6_zx = Stage_x()
-        
+        if self.sep:
+            # xyビュー用のステージ
+            self.stage_1_xy = Stage_1(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_2_xy = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_3_xy = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_4_xy = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_5_xy = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_6_xy = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            
+            # yzビュー用のステージ
+            self.stage_1_yz = Stage_1(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_2_yz = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_3_yz = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_4_yz = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_5_yz = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_6_yz = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            
+            # zxビュー用のステージ
+            self.stage_1_zx = Stage_1(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_2_zx = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_3_zx = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_4_zx = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_5_zx = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_6_zx = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+        else:                    
+            self.stage_1 = Stage_1(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_2 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_3 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_4 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_5 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_6 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.constant_(m.bias, 0)
     
     
-    def get_pafs(self, x, view='xy'):
+    def get_pafs(self, x, view="") -> Tuple[list, list, list]:
         """指定されたビュー用のステージを使用してPAFを取得"""
-        if view == 'xy':
-            stages = [self.stage_1_xy, self.stage_2_xy, self.stage_3_xy, 
-                     self.stage_4_xy, self.stage_5_xy, self.stage_6_xy]
-        elif view == 'yz':
-            stages = [self.stage_1_yz, self.stage_2_yz, self.stage_3_yz, 
-                     self.stage_4_yz, self.stage_5_yz, self.stage_6_yz]
-        elif view == 'zx':
-            stages = [self.stage_1_zx, self.stage_2_zx, self.stage_3_zx, 
-                     self.stage_4_zx, self.stage_5_zx, self.stage_6_zx]
-        else:
-            raise ValueError(f"Unknown view: {view}")
         
         pafs = []
         features = []
         masks_y = []
         
-        h1, F1, m = stages[0](x)
-        pafs.append(h1)
-        features.append(F1)
-        masks_y.append(m)
         
-        for stage in stages[1:]:
-            h1, F1, m = stage(torch.cat([h1, x], dim=1))
+        if self.sep:
+            if view == 'xy':
+                stages = [self.stage_1_xy, self.stage_2_xy, self.stage_3_xy, 
+                        self.stage_4_xy, self.stage_5_xy, self.stage_6_xy]
+            elif view == 'yz':
+                stages = [self.stage_1_yz, self.stage_2_yz, self.stage_3_yz, 
+                        self.stage_4_yz, self.stage_5_yz, self.stage_6_yz]
+            elif view == 'zx':
+                stages = [self.stage_1_zx, self.stage_2_zx, self.stage_3_zx, 
+                        self.stage_4_zx, self.stage_5_zx, self.stage_6_zx]
+            else:
+                raise ValueError(f"Unknown view: {view}")
+            
+            
+            h1, F1, m = stages[0](x)
             pafs.append(h1)
             features.append(F1)
             masks_y.append(m)
+            
+            for stage in stages[1:]:
+                h1, F1, m = stage(torch.cat([h1, x], dim=1))
+                pafs.append(h1)
+                features.append(F1)
+                masks_y.append(m)
         
+        else:
+            stages = [self.stage_1, self.stage_2, self.stage_3, 
+                      self.stage_4, self.stage_5, self.stage_6]
+            
+            h1, F1, m = stages[0](x)
+            pafs.append(h1)
+            features.append(F1)
+            masks_y.append(m)
+            
+            for stage in stages[1:]:
+                h1, F1, m = stage(torch.cat([h1, x], dim=1))
+                pafs.append(h1)
+                features.append(F1)
+                masks_y.append(m)
         return pafs, features, masks_y
     
+    
     def forward(self, x,labels=None,reduction_mag=None):
-        pafs_xy,features_xy,masks_xy = self.get_pafs(x, view='xy')
-        pafs_yz,features_yz,masks_yz = self.get_pafs(x, view='yz')
-        pafs_zx,features_zx,masks_zx = self.get_pafs(x, view='zx')
-        
-        # 各ステージごとに3つのビューを結合
-        pafs = [torch.cat([paf_xy, paf_yz, paf_zx], dim=1) 
-                for paf_xy, paf_yz, paf_zx in zip(pafs_xy, pafs_yz, pafs_zx)]
-        features = [torch.cat([feat_xy, feat_yz, feat_zx], dim=1) 
-                    for feat_xy, feat_yz, feat_zx in zip(features_xy, features_yz, features_zx)]
-        masks_y = [torch.cat([mask_xy.unsqueeze(1), mask_yz.unsqueeze(1), mask_zx.unsqueeze(1)], dim=1) 
-                   for mask_xy, mask_yz, mask_zx in zip(masks_xy, masks_yz, masks_zx)]
+        if self.sep:
+            pafs_xy,features_xy,masks_xy = self.get_pafs(x, view='xy')
+            pafs_yz,features_yz,masks_yz = self.get_pafs(x, view='yz')
+            pafs_zx,features_zx,masks_zx = self.get_pafs(x, view='zx')
+            
+            # 各ステージごとに3つのビューを結合
+            pafs = [torch.cat([paf_xy, paf_yz, paf_zx], dim=1) 
+                    for paf_xy, paf_yz, paf_zx in zip(pafs_xy, pafs_yz, pafs_zx)]
+            features = [torch.cat([feat_xy, feat_yz, feat_zx], dim=1) 
+                        for feat_xy, feat_yz, feat_zx in zip(features_xy, features_yz, features_zx)]
+            masks_y = [torch.cat([mask_xy.unsqueeze(1), mask_yz.unsqueeze(1), mask_zx.unsqueeze(1)], dim=1) 
+                    for mask_xy, mask_yz, mask_zx in zip(masks_xy, masks_yz, masks_zx)]
+        else:
+            pafs,features,masks_y = self.get_pafs(x)
         if self.training:
             assert labels is not None, "labels must be provided during training"
             assert reduction_mag is not None, "reduction_mag must be provided during training"
