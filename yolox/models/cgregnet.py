@@ -17,7 +17,7 @@ class TripleViewEncoder(nn.Module):
         super().__init__()
         # 共有畳み込み層
         self.conv_shared = nn.Sequential(
-            nn.Conv2d(384, 128, 3, padding=1),
+            nn.Conv2d(128*3, 128, 3, padding=1),
             nn.ReLU(),
             nn.Conv2d(128, 128, 3,stride=1, padding=1),
             nn.ReLU(),

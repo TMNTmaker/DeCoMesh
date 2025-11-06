@@ -48,8 +48,8 @@ class YOLOx3D(nn.Module):
 
         if stage == 1:
             # 学習: backbone, meshnet,classnet
-            unfreeze_module(self.backbone, True)
             unfreeze_module(self.classnet, True)
+            unfreeze_module(self.backbone, True)
             # 凍結: coordinate3d
             freeze_module(self.meshnet, True)
             freeze_module(self.coordinate3d, True)

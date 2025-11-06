@@ -161,7 +161,7 @@ class Exp(BaseExp):
         self.nmsthre = 0.65
 
     def get_model(self):
-        from yolox.models import YOLOx3D, EfficientNetFPN, ClassNet,MeshNet, TriView2CoordGrid
+        from yolox.models import YOLOx3D, ConvNeXtFPN, ClassNet,MeshNet, TriView2CoordGrid
         def init_yolo(M):
             for m in M.modules():
                 if isinstance(m, nn.BatchNorm2d):
@@ -169,7 +169,7 @@ class Exp(BaseExp):
                     m.momentum = 0.03
 
         if getattr(self, "model", None) is None:
-            backbone = EfficientNetFPN()
+            backbone = ConvNeXtFPN()
             classnet = ClassNet(in_channels=256, hidden=256, num_classes=len(SUNRGBD_CLASSES_20), dropout_p=0.1)
             meshnet = MeshNet()
             coordinate3d = TriView2CoordGrid()

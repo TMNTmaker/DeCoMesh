@@ -9,6 +9,7 @@ from .yolo_fpn import YOLOFPN
 #from .yolo_head import YOLOXHead
 from .yolo_pafpn import YOLOPAFPN
 from .efficientnet_fpn import EfficientNetFPN 
+from .convnext_fpn import ConvNeXtFPN
 from .yolox import YOLOX
 from .yolo3d import YOLOx3D
 from .classnet import ClassNet

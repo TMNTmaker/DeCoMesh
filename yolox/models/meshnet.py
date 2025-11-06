@@ -57,19 +57,19 @@ class Stage_1(nn.Module):
 
         elif self.learn_uv and not self.sep:
             dir_off_logit_xy = h1[:,0:2]
-            mag_off_logit_xy = h1[:,2]
+            mag_off_logit_xy = h1[:,2:3]
             dir_tgt_logit_xy = h1[:,3:5]
-            mag_tgt_logit_xy = h1[:,5]
+            mag_tgt_logit_xy = h1[:,5:6]
             
             dir_off_logit_yz = h1[:,6:8]
-            mag_off_logit_yz = h1[:,8]
+            mag_off_logit_yz = h1[:,8:9]
             dir_tgt_logit_yz = h1[:,9:11]
-            mag_tgt_logit_yz = h1[:,11]
+            mag_tgt_logit_yz = h1[:,11:12]
             
             dir_off_logit_zx = h1[:,12:14]
-            mag_off_logit_zx = h1[:,14]
+            mag_off_logit_zx = h1[:,14:15]
             dir_tgt_logit_zx = h1[:,15:17]
-            mag_tgt_logit_zx = h1[:,17]
+            mag_tgt_logit_zx = h1[:,17:18]
             
             m = h1[:,18:21]  # mask logits
             
@@ -102,22 +102,23 @@ class Stage_1(nn.Module):
                             v_pred_off_zx, v_pred_tgt_zx], dim= 1)  # B, 12, H, W
 
         elif not self.learn_uv and self.sep:
+            m = h1[:,4]
             h1 = self.softsign(h1[:,0:4]) # off_y, off_x, tgt_y, tgt_x
-            m = h1[:,4]  # mask logits  
                         
         
         elif not self.learn_uv and not self.sep:
-            h1 = self.softsign(h1[:,0:12]) 
             m = h1[:,12:14]  # mask logits
+            h1 = self.softsign(h1[:,0:12]) 
+
         return h1,F1,m
     
 class Stage_x(nn.Module):
-    def __init__(self,sep=False,learn_uv=False,chanel_scale=1):
+    def __init__(self,sep=True,learn_uv=True,chanel_scale=1):
         super(Stage_x, self).__init__()
         self.sep=sep
         self.learn_uv=learn_uv
         self.chanel_scale=chanel_scale
-        chn1 = 256+4
+        chn1 = 256+4 +(8 if not sep else 0)
         chn2 = int(128*self.chanel_scale)
 
         out_chn = 7 if self.learn_uv else 5
@@ -162,19 +163,19 @@ class Stage_x(nn.Module):
 
         elif self.learn_uv and not self.sep:
             dir_off_logit_xy = h1[:,0:2]
-            mag_off_logit_xy = h1[:,2]
+            mag_off_logit_xy = h1[:,2:3]
             dir_tgt_logit_xy = h1[:,3:5]
-            mag_tgt_logit_xy = h1[:,5]
+            mag_tgt_logit_xy = h1[:,5:6]
             
             dir_off_logit_yz = h1[:,6:8]
-            mag_off_logit_yz = h1[:,8]
+            mag_off_logit_yz = h1[:,8:9]
             dir_tgt_logit_yz = h1[:,9:11]
-            mag_tgt_logit_yz = h1[:,11]
+            mag_tgt_logit_yz = h1[:,11:12]
             
             dir_off_logit_zx = h1[:,12:14]
-            mag_off_logit_zx = h1[:,14]
+            mag_off_logit_zx = h1[:,14:15]
             dir_tgt_logit_zx = h1[:,15:17]
-            mag_tgt_logit_zx = h1[:,17]
+            mag_tgt_logit_zx = h1[:,17:18]
             
             m = h1[:,18:21]  # mask logits
             
@@ -207,13 +208,13 @@ class Stage_x(nn.Module):
                             v_pred_off_zx, v_pred_tgt_zx], dim= 1)  # B, 12, H, W
 
         elif not self.learn_uv and self.sep:
-            h1 = self.softsign(h1[:,0:4]) # off_y, off_x, tgt_y, tgt_x
             m = h1[:,4]  # mask logits  
+            h1 = self.softsign(h1[:,0:4]) # off_y, off_x, tgt_y, tgt_x
                         
         
         elif not self.learn_uv and not self.sep:
-            h1 = self.softsign(h1[:,0:12]) 
             m = h1[:,12:14]  # mask logits
+            h1 = self.softsign(h1[:,0:12]) 
         return h1,F1,m
     
 class MeshNet(nn.Module):
