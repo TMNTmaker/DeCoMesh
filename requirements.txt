@@ -25,3 +25,4 @@ onnx-simplifier==0.4.10
 pytorch3d==0.7.5
 efficientnet_pytorch==0.7.1
 timm==1.0.22
+einops==0.8.1

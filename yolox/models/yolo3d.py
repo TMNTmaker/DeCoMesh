@@ -104,7 +104,7 @@ class YOLOx3D(nn.Module):
                 
                 loss_2D, loss_offset2D, loss_target2D, _,features = self.meshnet(fpn0, targets["mesh"], 8)
                 loss_3D, loss_dict = \
-                    self.coordinate3d(features[-1], targets["mesh"], 8)
+                    self.coordinate3d(features, targets["mesh"], 8)
                 
                 total_loss = loss_2D+loss_3D  # 学習に使うのは3D系だけ
                 outputs |= loss_dict
@@ -122,7 +122,7 @@ class YOLOx3D(nn.Module):
             # 推論時はそのまま
             cls_prob = self.classnet(fpn0)
             meshout,features = self.meshnet(fpn0)
-            vertices, faces = self.coordinate3d(features[-1])
+            vertices, faces = self.coordinate3d(features)
             return {"cls_prob": cls_prob, "vertices": vertices, "faces": faces}
 
 

@@ -343,7 +343,7 @@ class Trainer:
         
         total = self.max_epoch
         if not hasattr(self.exp, "stage_epochs"):
-            e1 = max(1, total // 3)
+            e1 = 0#max(1, total // 3)
             e2 = max(1, (total - e1) // 2)
             e3 = max(1, total - e1 - e2)
             self.exp.stage_epochs = (e1, e2, e3)

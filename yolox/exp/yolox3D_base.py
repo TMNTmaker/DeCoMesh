@@ -122,7 +122,7 @@ class Exp(BaseExp):
         # epoch number used for warmup
         self.warmup_epochs = 5
         # max training epoch
-        self.max_epoch = 60#300
+        self.max_epoch = 40#300
         # minimum learning rate during warmup
         self.warmup_lr = 0
         self.min_lr_ratio = 0.05
@@ -161,7 +161,7 @@ class Exp(BaseExp):
         self.nmsthre = 0.65
 
     def get_model(self):
-        from yolox.models import YOLOx3D, ConvNeXtFPN, ClassNet,MeshNet, TriView2CoordGrid
+        from yolox.models import YOLOx3D, mobilenetv4FPN, ClassNet,transformer_threeviewNet, TriView2CoordGrid
         def init_yolo(M):
             for m in M.modules():
                 if isinstance(m, nn.BatchNorm2d):
@@ -169,9 +169,9 @@ class Exp(BaseExp):
                     m.momentum = 0.03
 
         if getattr(self, "model", None) is None:
-            backbone = ConvNeXtFPN()
-            classnet = ClassNet(in_channels=256, hidden=256, num_classes=len(SUNRGBD_CLASSES_20), dropout_p=0.1)
-            meshnet = MeshNet()
+            backbone = mobilenetv4FPN()
+            classnet = ClassNet(in_channels=128*2, hidden=128, num_classes=len(SUNRGBD_CLASSES_20), dropout_p=0.1)
+            meshnet = transformer_threeviewNet()
             coordinate3d = TriView2CoordGrid()
             self.model = YOLOx3D(backbone,classnet,meshnet,coordinate3d)
 

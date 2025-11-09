@@ -15,7 +15,7 @@ class Stage_1(nn.Module):
         self.learn_uv=learn_uv
         self.chanel_scale=chanel_scale
         
-        chn1 = 256
+        chn1 = 128*2
         chn2 = int(128*self.chanel_scale)
         chn3 = int(256*self.chanel_scale)
         out_chn = 7 if self.learn_uv else 5
@@ -27,6 +27,7 @@ class Stage_1(nn.Module):
         self.conv4_CPM_L1 = nn.Conv2d(in_channels=chn2, out_channels=chn3, kernel_size=1, stride=1, padding=0)
         self.conv5_CPM_L1 = nn.Conv2d(in_channels=chn3, out_channels=out_chn, kernel_size=1, stride=1, padding=0)
         self.relu = nn.ReLU()
+        self.bn   = nn.BatchNorm2d(num_features=out_chn)
         self.softsign = nn.Softsign()
         self.softplus = nn.Softplus()
         
@@ -107,7 +108,7 @@ class Stage_1(nn.Module):
                         
         
         elif not self.learn_uv and not self.sep:
-            m = h1[:,12:14]  # mask logits
+            m = h1[:,12:15]  # mask logits
             h1 = self.softsign(h1[:,0:12]) 
 
         return h1,F1,m
@@ -118,7 +119,7 @@ class Stage_x(nn.Module):
         self.sep=sep
         self.learn_uv=learn_uv
         self.chanel_scale=chanel_scale
-        chn1 = 256+4 +(8 if not sep else 0)
+        chn1 = 128*2+4 +(8 if not sep else 0)
         chn2 = int(128*self.chanel_scale)
 
         out_chn = 7 if self.learn_uv else 5
@@ -131,6 +132,7 @@ class Stage_x(nn.Module):
         self.conv5_L1 = nn.Conv2d(in_channels = chn2, out_channels = chn2, kernel_size = 7, stride = 1, padding = 3)
         self.conv6_L1 = nn.Conv2d(in_channels = chn2, out_channels = chn2, kernel_size = 1, stride = 1, padding = 0)
         self.conv7_L1 = nn.Conv2d(in_channels = chn2, out_channels = out_chn, kernel_size = 1, stride = 1, padding = 0)
+        self.bn   = nn.BatchNorm2d(num_features=out_chn)
         self.relu = nn.ReLU()
         self.softsign = nn.Softsign()
         self.softplus = nn.Softplus()
@@ -213,12 +215,12 @@ class Stage_x(nn.Module):
                         
         
         elif not self.learn_uv and not self.sep:
-            m = h1[:,12:14]  # mask logits
+            m = h1[:,12:15]  # mask logits
             h1 = self.softsign(h1[:,0:12]) 
         return h1,F1,m
     
 class MeshNet(nn.Module):
-    def __init__(self,sep=True,learn_uv=True,chanel_scale=1):
+    def __init__(self,sep=False,learn_uv=True,chanel_scale=1):
         super().__init__()
         self.sep=sep
         self.learn_uv=learn_uv
@@ -255,9 +257,15 @@ class MeshNet(nn.Module):
             self.stage_4 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
             self.stage_5 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
             self.stage_6 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.constant_(m.bias, 0)
+                # 重みをHe(Kaiming)初期化
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                # バイアスがある場合だけ0で初期化
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
     
     
     def get_pafs(self, x, view="") -> Tuple[list, list, list]:

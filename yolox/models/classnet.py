@@ -191,18 +191,19 @@ class ClassNet(nn.Module):
         
         
         
-# --- 動作確認 ---
-if __name__ == "__main__":
-    B, C, H, W = 2, 256, 80, 80
-    num_classes = 20
-
-    model = ClassNet(in_channels=C, hidden=256, num_classes=num_classes, dropout_p=0.1)
-    x = torch.randn(B, C, H, W)
-    y = model(x)
-    print(y.shape)  # torch.Size([2, 21, 80, 80])
-
-    # 例: セグメンテーションの損失（CrossEntropy）
-    # target は (B, H, W) のクラスIDマップ
-    target = torch.randint(0, num_classes, (B, H, W))
-    loss = F.cross_entropy(y, target)
-    print("loss:", float(loss))
+## --- 動作確認 ---
+#if __name__ == "__main__":
+#    B, C, H, W = 2, 256, 80, 80
+#    num_classes = 20
+#
+#    model = ClassNet(in_channels=C, hidden=256, num_classes=num_classes, dropout_p=0.1)
+#    x = torch.randn(B, C, H, W)
+#    y = model(x)
+#    print(y.shape)  # torch.Size([2, 21, 80, 80])
+#
+#    # 例: セグメンテーションの損失（CrossEntropy）
+#    # target は (B, H, W) のクラスIDマップ
+#    target = torch.randint(0, num_classes, (B, H, W))
+#    loss = F.cross_entropy(y, target)
+#    print("loss:", float(loss))
+#
