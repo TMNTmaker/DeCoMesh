@@ -15,7 +15,7 @@ class Stage_1(nn.Module):
         self.learn_uv=learn_uv
         self.chanel_scale=chanel_scale
         
-        chn1 = 128*2
+        chn1 = 128*4
         chn2 = int(128*self.chanel_scale)
         chn3 = int(256*self.chanel_scale)
         out_chn = 7 if self.learn_uv else 5
@@ -119,7 +119,7 @@ class Stage_x(nn.Module):
         self.sep=sep
         self.learn_uv=learn_uv
         self.chanel_scale=chanel_scale
-        chn1 = 128*2+4 +(8 if not sep else 0)
+        chn1 = 128*4+4 +(8 if not sep else 0)
         chn2 = int(128*self.chanel_scale)
 
         out_chn = 7 if self.learn_uv else 5
@@ -318,11 +318,12 @@ class MeshNet(nn.Module):
         return pafs, features, masks_y
     
     
-    def forward(self, x,labels=None,reduction_mag=None):
+    def forward(self, x,cls_feat,labels=None,reduction_mag=None):
+        feat = torch.cat([x,cls_feat], dim= 1)
         if self.sep:
-            pafs_xy,features_xy,masks_xy = self.get_pafs(x, view='xy')
-            pafs_yz,features_yz,masks_yz = self.get_pafs(x, view='yz')
-            pafs_zx,features_zx,masks_zx = self.get_pafs(x, view='zx')
+            pafs_xy,features_xy,masks_xy = self.get_pafs(feat, view='xy')
+            pafs_yz,features_yz,masks_yz = self.get_pafs(feat, view='yz')
+            pafs_zx,features_zx,masks_zx = self.get_pafs(feat, view='zx')
             
             # 各ステージごとに3つのビューを結合
             pafs = [torch.cat([paf_xy, paf_yz, paf_zx], dim=1) 
@@ -332,7 +333,7 @@ class MeshNet(nn.Module):
             masks_y = [torch.cat([mask_xy.unsqueeze(1), mask_yz.unsqueeze(1), mask_zx.unsqueeze(1)], dim=1) 
                     for mask_xy, mask_yz, mask_zx in zip(masks_xy, masks_yz, masks_zx)]
         else:
-            pafs,features,masks_y = self.get_pafs(x)
+            pafs,features,masks_y = self.get_pafs(feat)
         if self.training:
             assert labels is not None, "labels must be provided during training"
             assert reduction_mag is not None, "reduction_mag must be provided during training"
@@ -345,9 +346,9 @@ class MeshNet(nn.Module):
                                                  masks_y,masks_t)    
             torch.cuda.synchronize(); t2 = time.time()
             #print(f"Data processing time: {t1-t0:.4f}s, Loss calculation time: {t2-t1:.4f}s")
-            return loss_total,loss_offset,loss_target,pafs,features
+            return loss_total,loss_offset,loss_target,pafs[-1],features[-1]
         else:
-            return pafs,features  
+            return pafs[-1],features[-1]  
     
     
     @torch.no_grad()

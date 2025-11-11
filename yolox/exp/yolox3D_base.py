@@ -199,7 +199,7 @@ class Exp(BaseExp):
         self.nmsthre = 0.65
 
     def get_model(self):
-        from yolox.models import YOLOx3D, mobilenetv4FPN, ClassNet,transformer_threeviewNet, TriView2CoordGrid
+        from yolox.models import YOLOx3D, mobilenetv4FPN, ClassNet,transformer_threeviewNet,MeshNet, TriView2CoordGrid
         def init_yolo(M):
             for m in M.modules():
                 if isinstance(m, nn.BatchNorm2d):
@@ -209,7 +209,7 @@ class Exp(BaseExp):
         if getattr(self, "model", None) is None:
             backbone = mobilenetv4FPN()
             classnet = ClassNet(in_channels=128*2, hidden=128*2, num_classes=len(SUNRGBD_CLASSES_21), dropout_p=0.1)
-            meshnet = transformer_threeviewNet()
+            meshnet = MeshNet()#transformer_threeviewNet()
             coordinate3d = TriView2CoordGrid()
             self.model = YOLOx3D(backbone,classnet,meshnet,coordinate3d)
 
