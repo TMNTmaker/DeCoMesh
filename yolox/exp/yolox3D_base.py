@@ -208,7 +208,7 @@ class Exp(BaseExp):
 
         if getattr(self, "model", None) is None:
             backbone = mobilenetv4FPN()
-            classnet = ClassNet(in_channels=128*2, hidden=128, num_classes=len(SUNRGBD_CLASSES_21), dropout_p=0.1)
+            classnet = ClassNet(in_channels=128*2, hidden=128*2, num_classes=len(SUNRGBD_CLASSES_21), dropout_p=0.1)
             meshnet = transformer_threeviewNet()
             coordinate3d = TriView2CoordGrid()
             self.model = YOLOx3D(backbone,classnet,meshnet,coordinate3d)

@@ -54,7 +54,9 @@ class ClassNet(nn.Module):
             ConvBNAct(hidden, hidden, k=3, s=1, p=1),
         )
         # 1x1でクラス数へ
-        self.classifier = nn.Conv2d(hidden, self.num_classes, kernel_size=1, bias=True)
+        self.classifier_xy = nn.Conv2d(hidden, self.num_classes, kernel_size=1, bias=True)
+        self.classifier_yz = nn.Conv2d(hidden, self.num_classes, kernel_size=1, bias=True)
+        self.classifier_zx = nn.Conv2d(hidden, self.num_classes, kernel_size=1, bias=True)
 
         self._init_weights()
 
@@ -91,6 +93,7 @@ class ClassNet(nn.Module):
         outputs: torch.Tensor,      # (B, C, H, W)
         category: list[list],     # (B, N)  各オブジェクトのクラスID
         mesh: torch.Tensor,         # (B, N, 6, 4, 3) = (バッチ, オブジェクト, 面, 頂点, xyz)
+        direction: str = 'xy' ,    # 'xy','yz','zx'のいずれか
         reduction_mag: int = 8,
         bg_id: int = 0,
     ) -> torch.Tensor:
@@ -105,7 +108,14 @@ class ClassNet(nn.Module):
         """
         device = outputs.device
         B, C, H, W = outputs.shape
-
+        assert direction in ('xy','yz','zx'), "direction must be 'xy','yz' or 'zx'"
+        if direction == 'xy':
+            coord_idx1, coord_idx2, coord_idx3 = 0, 1, 2  # x, y, z
+        elif direction == 'yz':
+            coord_idx1, coord_idx2, coord_idx3 = 2, 1, 0  # y, z, x
+        else:  # 'zx'
+            coord_idx1, coord_idx2, coord_idx3 = 2, 0, 1  # z, x, y
+            
         # 初期化（背景ID）
         targets = torch.full((B, H, W), int(bg_id), dtype=torch.long, device=device)
 
@@ -125,8 +135,9 @@ class ClassNet(nn.Module):
 
             # オブジェクトの「平均Z」で奥→手前の順に並べる（Z大=遠い想定なので降順）
             # 形状: (N, 6, 4, 3) -> Zだけ抜き出して平均
-            z_mean = mesh_b[..., 2].mean(axis=(1, 2))  # (N,)
-            draw_order = np.argsort(-z_mean)  # 降順（奥→手前）
+            
+            q_mean = mesh_b[..., coord_idx3].mean(axis=(1, 2))  # (N,)
+            draw_order = np.argsort(-q_mean)  # 降順（奥→手前）
 
             # このバッチの targets を一旦CPUで編集（最後にデバイスへ）
             tgt_b = targets[b].cpu()
@@ -141,11 +152,11 @@ class ClassNet(nn.Module):
                 for f in range(faces.shape[0]):
                     # (4, 3) -> (4, 2) の (x, y) を使用
                     face_xyz = faces[f]        # (4, 3)
-                    poly_xy = face_xyz[:, :2]  # (4, 2) 画素座標（元画像）
+                    poly_nm = face_xyz[:, [coord_idx1,coord_idx2]]  # (4, 2) 画素座標（元画像）
                     # 特徴マップ解像度へ縮小
-                    poly_xy = poly_xy / float(reduction_mag)
+                    poly_nm = poly_nm / float(reduction_mag)
                     # マスク生成（HxW）
-                    mask = self._polygon_mask(H, W, poly_xy)  # bool, CPU
+                    mask = self._polygon_mask(H, W, poly_nm)  # bool, CPU
                     # クラスで上書き（手前の面/物体が最後に上書きされる）
                     if mask.any():
                         tgt_b[mask] = cls_id
@@ -165,18 +176,26 @@ class ClassNet(nn.Module):
         
         targets: (B, H, W) - 正解ラベル(クラスIDマップ)
         """
-        targets = self.build_targets_from_mesh(outputs, category, mesh, reduction_mag=reduction_mag, bg_id=bg_id)
+        targets_xy = self.build_targets_from_mesh(outputs[0], category, mesh,direction="xy", reduction_mag=reduction_mag, bg_id=bg_id)
+        targets_yz = self.build_targets_from_mesh(outputs[1], category, mesh,direction="yz", reduction_mag=reduction_mag, bg_id=bg_id)
+        targets_zx = self.build_targets_from_mesh(outputs[2], category, mesh,direction="zx", reduction_mag=reduction_mag, bg_id=bg_id)
         
         
-        loss = F.cross_entropy(outputs, targets, ignore_index=ignore_index)
+        loss = F.cross_entropy(outputs[0], targets_xy, ignore_index=ignore_index)
+        loss += F.cross_entropy(outputs[1], targets_yz, ignore_index=ignore_index)
+        loss += F.cross_entropy(outputs[2], targets_zx, ignore_index=ignore_index)
         return loss
     
     
     def forward(self, x, category=None,mesh=None, reduction_mag=None):
         # x: (B, 256, 80, 80)
         feat = self.stem(x)                 # -> (B, hidden, 80, 80)
-        logits = self.classifier(feat)      # -> (B, num_classes, 80, 80)
-        probs = torch.softmax(logits, dim=1)   # 確率が欲しいとき
+        logits_xy = self.classifier_xy(feat)      # -> (B, num_classes, 80, 80)
+        logits_yz = self.classifier_yz(feat)      # -> (B, num_classes, 80, 80)
+        logits_zx = self.classifier_zx(feat)      # -> (B, num_classes, 80, 80)
+        #結合
+        logits = torch.stack([logits_xy,logits_yz,logits_zx],dim=0) #(3,B,num_classes,80,80)
+        probs = torch.softmax(logits_xy, dim=2)   # 確率が欲しいとき
         #pred  = logits.argmax(dim=1)           # ラベルマップが欲しいとき
         
         if self.training:

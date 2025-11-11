@@ -124,7 +124,7 @@ class TriViewPAFTransformer(nn.Module):
     def __init__(
         self,
         learn_uv=False,
-        feat_dim: int = 256+128,
+        feat_dim: int = 256+128*2,
         map_size: int = 80,
         num_layers: int = 3,
         num_heads: int = 4,
