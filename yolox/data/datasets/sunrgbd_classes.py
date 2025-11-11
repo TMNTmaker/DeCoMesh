@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 # Copyright (c) Megvii, Inc. and its affiliates.
-SUNRGBD_CLASSES_20  = (
+SUNRGBD_CLASSES_21  = (
 "bathtub",
 "bed",
 "bookshelf",
@@ -22,6 +22,7 @@ SUNRGBD_CLASSES_20  = (
 "tv",
 "toilet",
 "others",
+"background",
 )
 
 

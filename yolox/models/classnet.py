@@ -42,9 +42,10 @@ class ClassNet(nn.Module):
     入力: (B, 256, 80, 80)
     出力: (B, num_classes, 80, 80)
     """
-    def __init__(self, in_channels=256, hidden=128, num_classes=21, dropout_p=0.1):
+    def __init__(self, in_channels=256, hidden=128, num_classes=20, dropout_p=0.1):
         super().__init__()
         # 前処理(チャネル圧縮はしない。必要ならhiddenを変えてOK)
+        self.num_classes = num_classes
         self.stem = nn.Sequential(
             ConvBNAct(in_channels, hidden, k=3, s=1, p=1),
             ResidualBlock(hidden),
@@ -53,7 +54,7 @@ class ClassNet(nn.Module):
             ConvBNAct(hidden, hidden, k=3, s=1, p=1),
         )
         # 1x1でクラス数へ
-        self.classifier = nn.Conv2d(hidden, num_classes, kernel_size=1, bias=True)
+        self.classifier = nn.Conv2d(hidden, self.num_classes, kernel_size=1, bias=True)
 
         self._init_weights()
 
@@ -184,10 +185,10 @@ class ClassNet(nn.Module):
             assert reduction_mag is not None, "reduction_mag must be provided during training"
             
             
-            loss = self.loss_all(logits, category,mesh,reduction_mag, ignore_index=-1, bg_id=-1)
-            return loss,probs#,logits
+            loss = self.loss_all(logits, category,mesh,reduction_mag, ignore_index=-1, bg_id=self.num_classes-1)
+            return loss,probs,feat
         else :
-            return probs#logits
+            return probs,feat
         
         
         

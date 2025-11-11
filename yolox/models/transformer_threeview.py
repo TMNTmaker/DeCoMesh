@@ -3,41 +3,7 @@ import torch.nn as nn
 from yolox.models.losses import *
 import time
 from typing import Tuple
-from einops import Rearrange
 
-
-
-class Patching(nn.Module):
-    def __init__(self, patch_size):
-        """ [input]
-            - patch_size (int) : パッチの縦の長さ（=横の長さ）
-        """
-        super().__init__()
-        self.net = Rearrange("b c (h ph) (w pw) -> b (h w) (ph pw c)", ph = patch_size, pw = patch_size)
-    
-    def forward(self, x):
-        """ [input]
-            - x (torch.Tensor) : 画像データ
-                - x.shape = torch.Size([batch_size, channels, image_height, image_width])
-        """
-        x = self.net(x)
-        return x
-class LinearProjection(nn.Module):
-    def __init__(self, patch_dim, dim):
-        """ [input]
-            - patch_dim (int) : 一枚あたりのパッチの次元（= channels * (patch_size ** 2)）
-            - dim (int) : パッチが変換されたベクトルの次元 
-        """
-        super().__init__()
-        self.net = nn.Linear(patch_dim, dim)
-
-    def forward(self, x):
-        """ [input]
-            - x (torch.Tensor) 
-                - x.shape = torch.Size([batch_size, n_patches, patch_dim])
-        """
-        x = self.net(x)
-        return x
 
 
 def build_2d_sincos_pos_embed(h, w, embed_dim, device=None):
@@ -158,7 +124,7 @@ class TriViewPAFTransformer(nn.Module):
     def __init__(
         self,
         learn_uv=False,
-        feat_dim: int = 256,
+        feat_dim: int = 256+128,
         map_size: int = 80,
         num_layers: int = 3,
         num_heads: int = 4,
@@ -169,10 +135,10 @@ class TriViewPAFTransformer(nn.Module):
         self.map_h = map_size
         self.map_w = map_size
 
-
+        self.token_emb = nn.Conv2d(self.feat_dim, self.feat_dim, kernel_size=3, padding=1)
         # 3つのviewトークン (front, side, top)
         self.view_tokens = nn.Parameter(torch.randn(3, feat_dim))
-        self.Patching=Patching(patch_size=8)
+
         
         # 2D位置埋め込み（今回は学習済パラメタにしてもいい）
         self.register_buffer(
@@ -197,17 +163,19 @@ class TriViewPAFTransformer(nn.Module):
 
         self.softsign = nn.Softsign()
         self.softplus = nn.Softplus()
+
         
-        
-    def forward(self, feat):
+    def forward(self, feat,cls_feat):
         """
-        feat: (B, 256, 80, 80)
+        feat: (B, 256+128, 80, 80)
         """
+        feat = torch.cat([feat,cls_feat], dim= 1)
         B, C, H, W = feat.shape
         #assert H == self.map_h and W == self.map_w, "backbone出力の空間サイズとpos_embedが一致している必要があります"
 
         # (B, C, H, W) -> (B, HW, C)
-        tokens = feat.flatten(2).transpose(1, 2)
+        tokens = self.token_emb(feat)
+        tokens = tokens.flatten(2).transpose(1, 2)
 
         tokens = tokens + self.pos_embed  # (1, HW, C) broadcast
 
@@ -314,8 +282,8 @@ class transformer_threeviewNet(nn.Module):
     
     
     
-    def forward(self, x,labels=None,reduction_mag=None):
-        pafs,features,masks_y = self.TriViewPAFTransformer(x)
+    def forward(self, x,cls_feat,labels=None,reduction_mag=None):
+        pafs,features,masks_y = self.TriViewPAFTransformer(x,cls_feat)
         
         if self.training:
             assert labels is not None, "labels must be provided during training"

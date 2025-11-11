@@ -90,21 +90,20 @@ class YOLOx3D(nn.Module):
 
             if self.stage == 1:
                 # === Stage 1: classnet のみ学習                
-                loss_class, cls_prob = self.classnet(fpn0, targets["category"], targets["mesh"], 8)
+                loss_class, cls_prob, cls_feat = self.classnet(fpn0, targets["category"], targets["mesh"], 8)
                 total_loss = loss_class  # 学習に使うのは2D/PAF系 classだけ
 
             elif self.stage == 2:
                 # === Stage 2: meshnet classnet  両方で学習（backboneにも勾配は流れる）
-                loss_class, cls_prob = self.classnet(fpn0, targets["category"], targets["mesh"], 8)
-                loss_2D, loss_offset2D, loss_target2D, _,features = self.meshnet(fpn0, targets["mesh"], 8)
+                loss_class, cls_prob, cls_feat = self.classnet(fpn0, targets["category"], targets["mesh"], 8)
+                loss_2D, loss_offset2D, loss_target2D, _,features = self.meshnet(fpn0,cls_feat, targets["mesh"], 8)
                 total_loss = loss_2D+loss_class  
 
             else:  # self.stage == 3
                 # === Stage 3: 
-                
-                loss_2D, loss_offset2D, loss_target2D, _,features = self.meshnet(fpn0, targets["mesh"], 8)
-                loss_3D, loss_dict = \
-                    self.coordinate3d(features, targets["mesh"], 8)
+                _, cls_feat = self.classnet(fpn0, targets["category"], targets["mesh"], 8)
+                loss_2D, loss_offset2D, loss_target2D, _,features = self.meshnet(fpn0,cls_feat, targets["mesh"], 8)
+                loss_3D, loss_dict = self.coordinate3d(features, targets["mesh"], 8)
                 
                 total_loss = loss_2D+loss_3D  # 学習に使うのは3D系だけ
                 outputs |= loss_dict
@@ -120,8 +119,8 @@ class YOLOx3D(nn.Module):
 
         else:
             # 推論時はそのまま
-            cls_prob = self.classnet(fpn0)
-            meshout,features = self.meshnet(fpn0)
+            cls_prob,cls_feat = self.classnet(fpn0)
+            meshout,features = self.meshnet(fpn0,cls_feat)
             vertices, faces = self.coordinate3d(features)
             return {"cls_prob": cls_prob, "vertices": vertices, "faces": faces}
 

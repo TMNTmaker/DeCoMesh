@@ -1,6 +1,6 @@
 
 from yolox.utils import evaluate_sunrgbd_3dIoU_mAP
-from yolox.data import SUNRGBD_CLASSES_20,SUNRGBD_CLASSES_38
+from yolox.data import SUNRGBD_CLASSES_21,SUNRGBD_CLASSES_38
 class SUNRGBDeval_opt:
     """
     This class is a simplified version of the COCO evaluation API for SUNRGB dataset.
@@ -24,7 +24,7 @@ class SUNRGBDeval_opt:
 
         
         results = evaluate_sunrgbd_3dIoU_mAP(self.sunrgbdDt,self.sunrgbdGt,
-                                             num_classes=len(SUNRGBD_CLASSES_20), 
+                                             num_classes=len(SUNRGBD_CLASSES_21), 
                                              iou_thresh_list=[0.25,0.5])
         
         self.stats = [results[0.25]["mAP"], results[0.5]["mAP"]]

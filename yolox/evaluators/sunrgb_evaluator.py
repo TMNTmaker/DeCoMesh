@@ -209,7 +209,7 @@ class SUNRGBDEvaluator:
 
     def convert_to_sunrgb_format(self, outputs, info_imgs, ids,
                                  categories,resize_coefes,cam_infoes,m3Dboxes):
-        from yolox.data import SUNRGBD_CLASSES_38, SUNRGBD_CLASSES_20
+        from yolox.data import SUNRGBD_CLASSES_38, SUNRGBD_CLASSES_21
         data_list = []
         sunrgbdDt = defaultdict(Dict[str, List[Det]])
         sunrgbdGt = defaultdict(Dict[str, List[GT]])
@@ -252,7 +252,7 @@ class SUNRGBDEvaluator:
                 # 範囲外ならスキップ
                 H, W = cls_prob.shape[-2:]
                 if not (0 <= u < W and 0 <= v < H):
-                    pred_labels.append(len(SUNRGBD_CLASSES_20)-1)  # dummy
+                    pred_labels.append(len(SUNRGBD_CLASSES_21)-1)  # dummy
                     scores.append(0.0)
                     continue
 
@@ -287,7 +287,7 @@ class SUNRGBDEvaluator:
             # GTの詰め方（OK版）
             if len(gt_m3Dboxes) > len(gt_category):
                 # gt_categoryに無い分は others で穴埋め
-                gt_category = list(gt_category) + [len(SUNRGBD_CLASSES_20)-1] * (len(gt_m3Dboxes) - len(gt_category))
+                gt_category = list(gt_category) + [len(SUNRGBD_CLASSES_21)-1] * (len(gt_m3Dboxes) - len(gt_category))
 
             
             

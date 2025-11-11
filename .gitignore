@@ -226,3 +226,6 @@ events.out.tfevents*
 .Trashes
 ehthumbs.db
 Thumbs.db
+input_image.png
+semantic_segmentation_targets.png
+semantic_segmentation.png

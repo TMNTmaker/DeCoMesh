@@ -7,7 +7,7 @@ import random
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from yolox.data import SUNRGBD_CLASSES_20, SUNRGBD_CLASSES_38
+from yolox.data import SUNRGBD_CLASSES_21, SUNRGBD_CLASSES_38
 from .base_exp import BaseExp
 
 __all__ = ["Exp", "check_exp_value"]
@@ -34,6 +34,44 @@ def collate_auto(batch: List[Any]):
     - dict/tuple/list は再帰的に処理
     - 文字列などは list のまま
     """
+    
+    def collate_auto_second(batch: List[Any]):
+        """
+        - テンソルは“形が完全一致”なら stack、そうでなければ list のまま
+        - dict/tuple/list は再帰的に処理
+        - 文字列などは list のまま
+        """
+        elem = batch[0]
+
+        # Tensor
+        if torch.is_tensor(elem):
+            return torch.stack(batch, 0) if _can_stack(batch) else batch
+
+        # numpy or number
+        if isinstance(elem, (np.ndarray, np.number, int, float)):
+            ts = [_to_tensor(x) for x in batch]
+            return torch.stack(ts, 0) if _can_stack(ts) else ts
+
+        # dict
+        if isinstance(elem, dict):
+            out = {}
+            keys = elem.keys()
+            for k in keys:
+                out[k] = collate_auto_second([b[k] for b in batch])
+            return out
+
+        # list / tuple
+        if isinstance(elem, (list, tuple)):
+            # すべて list/tuple かつ 長さが揃っているなら "列方向に" まとめる
+            if all(isinstance(b, (list, tuple)) for b in batch):
+                lens = [len(b) for b in batch]
+                if len(set(lens)) == 1:
+                    transposed =batch # list(zip(*batch))
+                    return type(elem)(collate_auto_second(list(items)) for items in transposed)
+            # それ以外（= 可変長）はそのまま返す（例: categories）
+            return batch
+        return batch
+
     elem = batch[0]
 
     # Tensor
@@ -60,7 +98,7 @@ def collate_auto(batch: List[Any]):
             lens = [len(b) for b in batch]
             if len(set(lens)) == 1:
                 transposed = list(zip(*batch))
-                return type(elem)(collate_auto(list(items)) for items in transposed)
+                return type(elem)(collate_auto_second(list(items)) for items in transposed)
         # それ以外（= 可変長）はそのまま返す（例: categories）
         return batch
     return batch
@@ -71,7 +109,7 @@ class Exp(BaseExp):
 
         # ---------------- model config ---------------- #
         # detect classes number of model
-        self.num_classes = len(SUNRGBD_CLASSES_20)
+        self.num_classes = len(SUNRGBD_CLASSES_21)
         # factor of model depth
         self.depth = 1.00
         # factor of model width
@@ -122,7 +160,7 @@ class Exp(BaseExp):
         # epoch number used for warmup
         self.warmup_epochs = 5
         # max training epoch
-        self.max_epoch = 40#300
+        self.max_epoch = 60#300
         # minimum learning rate during warmup
         self.warmup_lr = 0
         self.min_lr_ratio = 0.05
@@ -170,7 +208,7 @@ class Exp(BaseExp):
 
         if getattr(self, "model", None) is None:
             backbone = mobilenetv4FPN()
-            classnet = ClassNet(in_channels=128*2, hidden=128, num_classes=len(SUNRGBD_CLASSES_20), dropout_p=0.1)
+            classnet = ClassNet(in_channels=128*2, hidden=128, num_classes=len(SUNRGBD_CLASSES_21), dropout_p=0.1)
             meshnet = transformer_threeviewNet()
             coordinate3d = TriView2CoordGrid()
             self.model = YOLOx3D(backbone,classnet,meshnet,coordinate3d)
