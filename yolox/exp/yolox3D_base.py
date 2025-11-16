@@ -182,7 +182,7 @@ class Exp(BaseExp):
         self.print_interval = 10
         # eval period in epoch, for example,
         # if set to 1, model will be evaluate after every epoch.
-        self.eval_interval = 10
+        self.eval_interval = 20
         # save history checkpoint or not.
         # If set to False, yolox will only save latest and best ckpt.
         self.save_history_ckpt = True
@@ -209,7 +209,7 @@ class Exp(BaseExp):
         if getattr(self, "model", None) is None:
             backbone = mobilenetv4FPN()
             classnet = ClassNet(in_channels=128*2, hidden=128*2, num_classes=len(SUNRGBD_CLASSES_21), dropout_p=0.1)
-            meshnet = MeshNet()#transformer_threeviewNet()
+            meshnet = transformer_threeviewNet()
             coordinate3d = TriView2CoordGrid()
             self.model = YOLOx3D(backbone,classnet,meshnet,coordinate3d)
 

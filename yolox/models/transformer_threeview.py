@@ -124,7 +124,7 @@ class TriViewPAFTransformer(nn.Module):
     def __init__(
         self,
         learn_uv=False,
-        feat_dim: int = 256+128*2,
+        feat_dim: int = 256+128*0,
         map_size: int = 80,
         num_layers: int = 3,
         num_heads: int = 4,
@@ -169,7 +169,7 @@ class TriViewPAFTransformer(nn.Module):
         """
         feat: (B, 256+128, 80, 80)
         """
-        feat = torch.cat([feat,cls_feat], dim= 1)
+        feat = cls_feat#torch.cat([feat,cls_feat], dim= 1)
         B, C, H, W = feat.shape
         #assert H == self.map_h and W == self.map_w, "backbone出力の空間サイズとpos_embedが一致している必要があります"
 
