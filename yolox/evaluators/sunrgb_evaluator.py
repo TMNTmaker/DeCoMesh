@@ -227,9 +227,9 @@ class SUNRGBDEvaluator:
             
             
             
-            virtex_world = self.image_to_world(vertices/resize_coef, 
-                                cam_intrinsics, 
-                                cam_extrinsics)
+            virtex_world = vertices#self.image_to_world(vertices/resize_coef, 
+                           #     cam_intrinsics, 
+                           #     cam_extrinsics)
             pred_3dboxes = self.mesh_to_3dbox_multi(virtex_world,faces)
             #pred_3dboxexとoutput[:]["cls_plob"]を結びつける
             #output[:]["cls_plob"]は　(B, num_classes, H, W)
@@ -257,7 +257,7 @@ class SUNRGBDEvaluator:
                     continue
 
                 # クラス確率取得
-                cls_probs = cls_prob[ :, v, u]  # (num_classes,)
+                cls_probs = cls_prob[0, :, v, u]  # (num_classes,)
                 label = int(torch.argmax(cls_probs).item())
                 score = float(torch.max(cls_probs).item())
                 pred_labels.append(label)

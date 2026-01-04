@@ -3,7 +3,7 @@
 # Copyright (c) Megvii, Inc. and its affiliates.
 
 import argparse
-import os
+import os,sys
 import random
 import warnings
 from loguru import logger
@@ -11,7 +11,7 @@ from loguru import logger
 import torch
 import torch.backends.cudnn as cudnn
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 from yolox.core import launch
 from yolox.exp import get_exp
 from yolox.utils import (

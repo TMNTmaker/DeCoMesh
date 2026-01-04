@@ -60,9 +60,10 @@ class ClassNet(nn.Module):
         self.classifier_xym = nn.Conv2d(hidden, self.num_classes, kernel_size=1, bias=True)
         self.classifier_yzm = nn.Conv2d(hidden, self.num_classes, kernel_size=1, bias=True)
         self.classifier_zxm = nn.Conv2d(hidden, self.num_classes, kernel_size=1, bias=True)
-
-
-
+        # NOTE:
+        # - Softmax は「レイヤー(Conv2d)」ではなく「出力(logits)」に適用するもの。
+        # - さらに学習時は `F.cross_entropy` が内部で log-softmax を取るため、
+        #   ここで softmax を掛けると学習が壊れる（数値的にも不利）。
         self._init_weights()
 
     def _init_weights(self):
@@ -184,20 +185,20 @@ class ClassNet(nn.Module):
         
         targets: (B, H, W) - 正解ラベル(クラスIDマップ)
         """
-        targets_xy_p = self.build_targets_from_mesh(outputs[0], category, mesh,direction="xyp", reduction_mag=reduction_mag, bg_id=bg_id)
-        targets_xy_m = self.build_targets_from_mesh(outputs[1], category, mesh,direction="xym", reduction_mag=reduction_mag, bg_id=bg_id)
-        targets_yz_p = self.build_targets_from_mesh(outputs[2], category, mesh,direction="yzp", reduction_mag=reduction_mag, bg_id=bg_id)
-        targets_yz_m = self.build_targets_from_mesh(outputs[3], category, mesh,direction="yzm", reduction_mag=reduction_mag, bg_id=bg_id)
-        targets_zx_p = self.build_targets_from_mesh(outputs[4], category, mesh,direction="zxp", reduction_mag=reduction_mag, bg_id=bg_id)
-        targets_zx_m = self.build_targets_from_mesh(outputs[5], category, mesh,direction="zxm", reduction_mag=reduction_mag, bg_id=bg_id)
+        targets_xy_p = self.build_targets_from_mesh(outputs[:,0], category, mesh,direction="xyp", reduction_mag=reduction_mag, bg_id=bg_id)
+        targets_xy_m = self.build_targets_from_mesh(outputs[:,1], category, mesh,direction="xym", reduction_mag=reduction_mag, bg_id=bg_id)
+        targets_yz_p = self.build_targets_from_mesh(outputs[:,2], category, mesh,direction="yzp", reduction_mag=reduction_mag, bg_id=bg_id)
+        targets_yz_m = self.build_targets_from_mesh(outputs[:,3], category, mesh,direction="yzm", reduction_mag=reduction_mag, bg_id=bg_id)
+        targets_zx_p = self.build_targets_from_mesh(outputs[:,4], category, mesh,direction="zxp", reduction_mag=reduction_mag, bg_id=bg_id)
+        targets_zx_m = self.build_targets_from_mesh(outputs[:,5], category, mesh,direction="zxm", reduction_mag=reduction_mag, bg_id=bg_id)
         
         
-        loss  = F.cross_entropy(outputs[0], targets_xy_p, ignore_index=ignore_index)
-        loss += F.cross_entropy(outputs[1], targets_xy_m, ignore_index=ignore_index)
-        loss += F.cross_entropy(outputs[2], targets_yz_p, ignore_index=ignore_index)
-        loss += F.cross_entropy(outputs[3], targets_yz_m, ignore_index=ignore_index)
-        loss += F.cross_entropy(outputs[4], targets_zx_p, ignore_index=ignore_index)
-        loss += F.cross_entropy(outputs[5], targets_zx_m, ignore_index=ignore_index)
+        loss  = F.cross_entropy(outputs[:,0], targets_xy_p, ignore_index=ignore_index)
+        loss += F.cross_entropy(outputs[:,1], targets_xy_m, ignore_index=ignore_index)
+        loss += F.cross_entropy(outputs[:,2], targets_yz_p, ignore_index=ignore_index)
+        loss += F.cross_entropy(outputs[:,3], targets_yz_m, ignore_index=ignore_index)
+        loss += F.cross_entropy(outputs[:,4], targets_zx_p, ignore_index=ignore_index)
+        loss += F.cross_entropy(outputs[:,5], targets_zx_m, ignore_index=ignore_index)
         
         return loss
     
@@ -214,8 +215,8 @@ class ClassNet(nn.Module):
         #結合
         logits = torch.stack([logits_xyp,logits_xym,
                               logits_yzp,logits_yzm,
-                              logits_zxp,logits_zxm],dim=0) #(3,B,num_classes,80,80)
-        probs = torch.softmax(logits_xyp, dim=2)   # 確率が欲しいとき
+                              logits_zxp,logits_zxm],dim=1) #(B,6,num_classes,80,80)
+        probs = torch.softmax(logits, dim=2)   # 確率が欲しいとき
         #pred  = logits.argmax(dim=1)           # ラベルマップが欲しいとき
         
         if self.training:

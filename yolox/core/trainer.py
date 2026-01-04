@@ -384,7 +384,7 @@ class Trainer:
             cnts = {
                 "backbone": _cnt_trainable(mm.backbone),
                 "classnet": _cnt_trainable(mm.classnet),
-                "meshnet":  _cnt_trainable(mm.meshnet),
+                #"meshnet":  _cnt_trainable(mm.meshnet),
                 "coord3d":  _cnt_trainable(mm.coordinate3d),
             }
             opt_nparams = sum(len(g["params"]) for g in self.optimizer.param_groups)

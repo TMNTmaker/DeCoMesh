@@ -297,13 +297,13 @@ class SUNRGBDDataset(CacheDataset):
 
 
             #res.append(np.array(o3b_new)[faces_all])
-            cube_min=[-4, -4, 0]
+            cube_min=[-4+0.1, -4+0.1, 0+0.1]
             cube_max=[ 4-0.1,  4-0.1, 8-0.1]
             cube_offset =[4,4,0]
             points = o3b.tolist() 
             clipped_points = [] 
             for pt in points: 
-                x, y, z = pt 
+                x, y, z = [pt[0]*1, pt[1]*1, pt[2]*1]
                 clipped = [x, y, z] 
                 for i, v in enumerate([x, y, z]): 
                     if v < cube_min[i]: 

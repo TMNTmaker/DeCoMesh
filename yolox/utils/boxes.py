@@ -644,13 +644,13 @@ def cluster_vectors3D_torch_fast(
     # ====== 始点・終点の 3D 座標を一括生成 ======
     # 始点（+側の停止セル）
     o0 = off[:, cz_p, cy_p, cx_p].transpose(0,1) + 0.5  # (K,3) (oz,oy,ox)
-    p0_grid = torch.stack([cz_p.to(dtypef), cy_p.to(dtypef), cx_p.to(dtypef)], dim=1)
+    p0_grid = torch.stack([cx_p.to(dtypef), cy_p.to(dtypef), cz_p.to(dtypef)], dim=1)
     p0_off  = torch.stack([o0[:,2], o0[:,1], o0[:,0]], dim=1)  # to (x,y,z) 順
     p0 = (p0_grid + p0_off) * mag                  # (K,3) -> (x,y,z)
 
     # 終点（-側の停止セル）
     o1 = off[:, cz_m, cy_m, cx_m].transpose(0,1) + 0.5
-    p1_grid = torch.stack([cz_m.to(dtypef), cy_m.to(dtypef), cx_m.to(dtypef)], dim=1)
+    p1_grid = torch.stack([cx_m.to(dtypef), cy_m.to(dtypef), cz_m.to(dtypef)], dim=1)
     p1_off  = torch.stack([o1[:,2], o1[:,1], o1[:,0]], dim=1)
     p1 = (p1_grid + p1_off) * mag                               # (K,3) (x,y,z)
     

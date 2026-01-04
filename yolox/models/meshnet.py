@@ -1,24 +1,81 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from yolox.models.losses import *
 import time
 from typing import Tuple
 
 
 
+def get_gradient_norm(phi):
+    """
+    レベルセット関数 φ の勾配の大きさ |∇φ| を計算する
+    (一次元上げた曲面のスロープの急さを求める)
+    """
+    # 空間微分 (Central Difference)
+    # パディングしてサイズが変わらないようにする
+    phi_pad = F.pad(phi, (1, 1, 1, 1), mode='replicate')
+    
+    # x方向、y方向の微分
+    dx = (phi_pad[:, :, 1:-1, 2:] - phi_pad[:, :, 1:-1, :-2]) / 2.0
+    dy = (phi_pad[:, :, 2:, 1:-1] - phi_pad[:, :, :-2, 1:-1]) / 2.0
+    
+    # ノルム計算 (|v| = sqrt(x^2 + y^2))
+    grad_norm = torch.sqrt(dx**2 + dy**2 + 1e-6)
+    return grad_norm
+
+# ==========================================
+# 3. Active Contour Layer (物理シミュレーション層)
+# ==========================================
+class ActiveContourLayer(nn.Module):
+    """
+    微分方程式に従って φ を時間発展させる層
+    ∂φ/∂t = - G * |∇φ| (をベースにした更新)
+    """
+    def __init__(self, num_steps=5, dt=0.5):
+        super().__init__()
+        self.num_steps = num_steps
+        self.dt = dt
+
+    def forward(self, init_phi, g_map):
+        current_phi = init_phi
+        
+        # ここでループを回すが、初期値が良いので少なくて済む
+        for t in range(self.num_steps):
+            # 1. 勾配の大きさを計算 (一次元上の微分の準備)
+            grad_norm = get_gradient_norm(current_phi)
+            
+            # 2. 更新量の計算
+            # Gが大きい(平坦) -> 大きく動く
+            # Gが小さい(エッジ) -> 0に近づき、動きが止まる
+            # ※符号は学習によって「膨らむ」か「縮む」か自動調整されますが、
+            #   ここでは「エッジに向かって進む」力として作用します。
+            #   Active Contourの定式化: d_phi = G * |grad_phi| * (balloon_force + curvature)
+            #   今回はニューラルネットが φ_0 をうまく作るので、単純な smoothing flow で十分
+            
+            # (簡易版Level Set更新則)
+            # エッジマップに従って形状を微修正
+            d_phi = g_map * grad_norm
+            
+            # 3. 時間発展
+            # U-Netの出力次第で + か - か決まるが、ここでは拡散方向へ進める
+            current_phi = current_phi + self.dt * d_phi
+            
+        return current_phi
 
 
 class Stage_1(nn.Module):
-    def __init__(self,sep=False,learn_uv=False,chanel_scale=1):
+    def __init__(self,sep=False,learn_uv=False,phi=True,chanel_scale=1):
         super(Stage_1, self).__init__()
         self.sep=sep
         self.learn_uv=learn_uv
         self.chanel_scale=chanel_scale
-        
-        chn1 = 128*4
+        self.phi=phi
+        chn1 = 512#126#128*2+6
         chn2 = int(128*self.chanel_scale)
         chn3 = int(256*self.chanel_scale)
         out_chn = 7 if self.learn_uv else 5
+        out_chn = 8 if self.phi else out_chn
         out_chn = out_chn*3 if not self.sep else out_chn
 
         self.conv1_CPM_L1 = nn.Conv2d(in_channels=chn1, out_channels=chn2, kernel_size=3, stride=1, padding=1)
@@ -106,23 +163,28 @@ class Stage_1(nn.Module):
             m = h1[:,4]
             h1 = self.softsign(h1[:,0:4]) # off_y, off_x, tgt_y, tgt_x
                         
-        
-        elif not self.learn_uv and not self.sep:
+        elif not self.learn_uv and not self.sep and not self.phi:
             m = h1[:,12:15]  # mask logits
             h1 = self.softsign(h1[:,0:12]) 
+        elif not self.learn_uv and not self.sep and self.phi:
+            m=[]
 
         return h1,F1,m
     
 class Stage_x(nn.Module):
-    def __init__(self,sep=True,learn_uv=True,chanel_scale=1):
+    def __init__(self,sep=True,learn_uv=True,phi=True,chanel_scale=1):
         super(Stage_x, self).__init__()
         self.sep=sep
         self.learn_uv=learn_uv
         self.chanel_scale=chanel_scale
-        chn1 = 128*4+4 +(8 if not sep else 0)
+        self.phi=phi
+        chn1 = 536
+        #chn1 = 128*2+6+4 +(8 if not sep else 0)
+        #chn1 = 126+4 +(8 if not sep else 0)
         chn2 = int(128*self.chanel_scale)
 
         out_chn = 7 if self.learn_uv else 5
+        out_chn = 8 if self.phi else out_chn
         out_chn = out_chn*3 if not self.sep else out_chn
 
         self.conv1_L1 = nn.Conv2d(in_channels = chn1, out_channels = chn2, kernel_size = 7, stride = 1, padding = 3)
@@ -214,52 +276,99 @@ class Stage_x(nn.Module):
             h1 = self.softsign(h1[:,0:4]) # off_y, off_x, tgt_y, tgt_x
                         
         
-        elif not self.learn_uv and not self.sep:
+        elif not self.learn_uv and not self.sep and not self.phi:
             m = h1[:,12:15]  # mask logits
             h1 = self.softsign(h1[:,0:12]) 
+        elif not self.learn_uv and not self.sep and self.phi:
+            m = [] 
         return h1,F1,m
     
 class MeshNet(nn.Module):
-    def __init__(self,sep=False,learn_uv=True,chanel_scale=1):
+    def __init__(self,sep=False,learn_uv=False,phi=True,chanel_scale=1):
         super().__init__()
         self.sep=sep
         self.learn_uv=learn_uv
         self.chanel_scale=chanel_scale
-        
+        self.phi=phi
+        """
+        if self.phi:
+            # 入力チャネル数
+            self.in_channels = 6
+            # 各チャネルに対する出力数 (x微分とy微分)
+            self.out_per_channel = 2
+            # 合計出力チャネル数 (6 * 2 = 12)
+            self.out_channels = self.in_channels * self.out_per_channel
+            # Conv2dの定義
+            # groups=in_channels とすることで、各入力チャネルが独立して処理されます
+            # ただし、出力が2倍になるため、正確には depthwise ではなく grouped convolution です
+            self.sobel_conv = nn.Conv2d(
+                in_channels=self.in_channels,
+                out_channels=self.out_channels,
+                kernel_size=3,
+                padding=1,      # 入力と出力のサイズを変えない場合
+                bias=False,
+                groups=self.in_channels # 重要: 入力chごとにフィルタを分ける
+            )
+            self.sobel_x = torch.tensor([[-1., 0., 1.], 
+                                        [-2., 0., 2.], 
+                                        [-1., 0., 1.]])
+            # y方向の微分カーネル
+            self.sobel_y = torch.tensor([[-1., -2., -1.], 
+                                        [ 0.,  0.,  0.], 
+                                        [ 1.,  2.,  1.]])
+            # 重みの作成 (Output Ch, Input Ch / Groups, K, K) -> (12, 1, 3, 3)
+            # 並び順を [ch1_x, ch1_y, ch2_x, ch2_y, ...] となるようにスタックします
+            self.sobel_weights = []
+            for _ in range(self.in_channels):
+                self.sobel_weights.append(self.sobel_x)
+                self.sobel_weights.append(self.sobel_y)
+                
+            # テンソル化して形状を整える
+            weight_tensor = torch.stack(self.sobel_weights).unsqueeze(1)
+            
+            # Conv2dの重みにセットし、学習されないように固定する
+            self.sobel_conv.weight = nn.Parameter(weight_tensor, requires_grad=False)
+        """
         if self.sep:
             # xyビュー用のステージ
-            self.stage_1_xy = Stage_1(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_2_xy = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_3_xy = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_4_xy = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_5_xy = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_6_xy = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_1_xy = Stage_1(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_2_xy = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_3_xy = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_4_xy = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_5_xy = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_6_xy = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
             
             # yzビュー用のステージ
-            self.stage_1_yz = Stage_1(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_2_yz = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_3_yz = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_4_yz = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_5_yz = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_6_yz = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_1_yz = Stage_1(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_2_yz = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_3_yz = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_4_yz = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_5_yz = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_6_yz = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
             
             # zxビュー用のステージ
-            self.stage_1_zx = Stage_1(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_2_zx = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_3_zx = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_4_zx = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_5_zx = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_6_zx = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_1_zx = Stage_1(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_2_zx = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_3_zx = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_4_zx = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_5_zx = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_6_zx = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
         else:                    
-            self.stage_1 = Stage_1(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_2 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_3 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_4 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_5 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
-            self.stage_6 = Stage_x(self.sep,self.learn_uv,self.chanel_scale)
+            self.stage_1 = Stage_1(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_2 = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_3 = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_4 = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_5 = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
+            self.stage_6 = Stage_x(self.sep,self.learn_uv,self.phi,self.chanel_scale)
 
+        if self.phi:
+            self.ac_layer = ActiveContourLayer(num_steps=5, dt=0.1)
+            
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
+                # Sobelフィルタは初期化をスキップ（後で手動設定するか、既に設定済み）
+                if hasattr(self, 'sobel_conv') and m is self.sobel_conv:
+                    continue
                 # 重みをHe(Kaiming)初期化
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 # バイアスがある場合だけ0で初期化
@@ -312,14 +421,34 @@ class MeshNet(nn.Module):
             
             for stage in stages[1:]:
                 h1, F1, m = stage(torch.cat([h1, x], dim=1))
-                pafs.append(h1)
+                if self.phi:                    
+                    #h1 = self.sobel_conv(h1)
+                    h1_list = []
+                    for i in range(h1.shape[1]//2):
+                        h1_list.append(self.ac_layer(h1[:,[i]],h1[:,[i+1]]))
+                    h1_ = torch.cat(h1_list, dim=1)
+
+
+                    
+
+                pafs.append(h1_)
                 features.append(F1)
                 masks_y.append(m)
         return pafs, features, masks_y
     
     
     def forward(self, x,cls_feat,labels=None,reduction_mag=None):
-        feat = torch.cat([x,cls_feat], dim= 1)
+        # [B, 6*C, H, W] に畳み込んで NCHW に合わせる
+        if cls_feat is not None and cls_feat.dim() == 5:
+            # (B, V, C, H, W) に対応
+            if cls_feat.shape[0] == x.shape[0]:
+                #(B,V*C,H,W)にする
+                cls_feat = cls_feat.reshape(cls_feat.shape[0],
+                                            -1,
+                                            cls_feat.shape[3],
+                                            cls_feat.shape[4])                
+                     
+        feat = torch.cat([x, cls_feat], dim=1)
         if self.sep:
             pafs_xy,features_xy,masks_xy = self.get_pafs(feat, view='xy')
             pafs_yz,features_yz,masks_yz = self.get_pafs(feat, view='yz')
@@ -334,6 +463,7 @@ class MeshNet(nn.Module):
                     for mask_xy, mask_yz, mask_zx in zip(masks_xy, masks_yz, masks_zx)]
         else:
             pafs,features,masks_y = self.get_pafs(feat)
+        
         if self.training:
             assert labels is not None, "labels must be provided during training"
             assert reduction_mag is not None, "reduction_mag must be provided during training"
@@ -342,11 +472,10 @@ class MeshNet(nn.Module):
             torch.cuda.synchronize(); t0 = time.time()
             pafs_t,masks_t= self.data_process_torch(x,joint_list,reduction_mag)
             torch.cuda.synchronize(); t1 = time.time()
-            loss_total,loss_offset,loss_target=self.loss_all(pafs,pafs_t,
-                                                 masks_y,masks_t)    
+            loss_total,loss_dict=self.loss_all(pafs,pafs_t,masks_y,masks_t)    
             torch.cuda.synchronize(); t2 = time.time()
             #print(f"Data processing time: {t1-t0:.4f}s, Loss calculation time: {t2-t1:.4f}s")
-            return loss_total,loss_offset,loss_target,pafs[-1],features[-1]
+            return loss_total,loss_dict,pafs[-1],features[-1]
         else:
             return pafs[-1],features[-1]  
     
@@ -544,15 +673,10 @@ class MeshNet(nn.Module):
                      paf_t, 
                      masks_y,
                      mask_t,
-                     #lambda_offset=1.0,
-                     #lambda_target=1.0
                      ):
         
-        loss_total = 0
-        torch.cuda.synchronize(); t0 = time.time()
-        
+        loss_total = 0        
         # compute loss on each stage
-        
         for paf_y,mask_y in zip(pafs_y, masks_y):
            
            
@@ -561,34 +685,50 @@ class MeshNet(nn.Module):
             #loss_target = lambda_target*mean_square_error(pafs_y[:, [2,3,6,7,10,11]], 
             #                                            pafs_t[:, [2,3,6,7,10,11]])                      
             #
-            
-            
-            loss_offset_xy,*_ =loss_sparse_vector_field(
-                                mask_y[:,[0]], paf_y[:, [0,1]] 
-                                 ,mask_t[:,[0]], paf_t[:, [0,1]])
-            loss_offset_yz,*_ =loss_sparse_vector_field(
-                                mask_y[:,[1]], paf_y[:, [4,5]] 
-                                 ,mask_t[:,[1]], paf_t[:, [4,5]])
-            loss_offset_zx,*_ =loss_sparse_vector_field(
-                                mask_y[:,[2]], paf_y[:, [8,9]] 
-                                 ,mask_t[:,[2]], paf_t[:, [8,9]])
+            if self.phi:
+                loss_offset_xy = levelset_loss(paf_y[:,[0,1]],paf_t[:,[0,1]],mask_t[:,[0]])
+                loss_offset_yz = levelset_loss(paf_y[:,[4,5]],paf_t[:,[4,5]],mask_t[:,[1]])
+                loss_offset_zx = levelset_loss(paf_y[:,[8,9]],paf_t[:,[8,9]],mask_t[:,[2]])
+                loss_target_xy = levelset_loss(paf_y[:,[2,3]],paf_t[:,[2,3]],mask_t[:,[0]])
+                loss_target_yz = levelset_loss(paf_y[:,[6,7]],paf_t[:,[6,7]],mask_t[:,[1]])
+                loss_target_zx = levelset_loss(paf_y[:,[10,11]],paf_t[:,[10,11]],mask_t[:,[2]])
+                loss_offset2D = loss_offset_xy + loss_offset_yz + loss_offset_zx 
+                loss_target2D = loss_target_xy + loss_target_yz + loss_target_zx 
 
-            loss_target_xy,*_ =loss_sparse_vector_field(
-                                mask_y[:,[0]], paf_y[:, [2,3]] 
-                                 ,mask_t[:,[0]], paf_t[:, [2,3]])
-            loss_target_yz,*_ =loss_sparse_vector_field(
-                                mask_y[:,[1]], paf_y[:, [6,7]] 
-                                 ,mask_t[:,[1]], paf_t[:, [6,7]])
-            loss_target_zx,*_ =loss_sparse_vector_field(
-                                mask_y[:,[2]], paf_y[:, [10,11]] 
-                                 ,mask_t[:,[2]], paf_t[:, [10,11]])
-            
-            loss_offset = loss_offset_xy + loss_offset_yz + loss_offset_zx 
-            loss_target = loss_target_xy + loss_target_yz + loss_target_zx 
-            loss_total += loss_offset + loss_target
-        torch.cuda.synchronize(); t1 = time.time()
-        #print(f"mesh loss processing time: {t1-t0:.4f}s")
-        return loss_total, loss_offset,loss_target
+            else:
+                loss_offset_xy,L_det_offset_xy,L_vec_offset_xy,L_neg_offset_xy =loss_sparse_vector_field(
+                                    mask_y[:,[0]], paf_y[:, [0,1]] 
+                                ,mask_t[:,[0]], paf_t[:, [0,1]])
+                loss_offset_yz,L_det_offset_yz,L_vec_offset_yz,L_neg_offset_yz =loss_sparse_vector_field(
+                                    mask_y[:,[1]], paf_y[:, [4,5]] 
+                                ,mask_t[:,[1]], paf_t[:, [4,5]])
+                loss_offset_zx,L_det_offset_zx,L_vec_offset_zx,L_neg_offset_zx =loss_sparse_vector_field(
+                                    mask_y[:,[2]], paf_y[:, [8,9]] 
+                                ,mask_t[:,[2]], paf_t[:, [8,9]])
+
+                loss_target_xy,L_det_target_xy,L_vec_target_xy,L_neg_target_xy =loss_sparse_vector_field(
+                                    mask_y[:,[0]], paf_y[:, [2,3]] 
+                                    ,mask_t[:,[0]], paf_t[:, [2,3]])
+                loss_target_yz,L_det_target_yz,L_vec_target_yz,L_neg_target_yz =loss_sparse_vector_field(
+                                    mask_y[:,[1]], paf_y[:, [6,7]] 
+                                    ,mask_t[:,[1]], paf_t[:, [6,7]])
+                loss_target_zx,L_det_target_zx,L_vec_target_zx,L_neg_target_zx =loss_sparse_vector_field(
+                                    mask_y[:,[2]], paf_y[:, [10,11]] 
+                                    ,mask_t[:,[2]], paf_t[:, [10,11]])
+                
+                loss_offset2D = loss_offset_xy + loss_offset_yz + loss_offset_zx 
+                loss_target2D = loss_target_xy + loss_target_yz + loss_target_zx 
+            loss_total += loss_offset2D + loss_target2D
+
+        return loss_total, dict(loss_offset2D=loss_offset2D,
+                                loss_target2D=loss_target2D,
+                                #loss_det_offset2D=L_det_offset_xy + L_det_offset_yz + L_det_offset_zx,
+                                #loss_vec_offset2D=L_vec_offset_xy + L_vec_offset_yz + L_vec_offset_zx,
+                                #loss_neg_offset2D=L_neg_offset_xy + L_neg_offset_yz + L_neg_offset_zx,
+                                #loss_det_target2D=L_det_target_xy + L_det_target_yz + L_det_target_zx,
+                                #loss_vec_target2D=L_vec_target_xy + L_vec_target_yz + L_vec_target_zx,
+                                #loss_neg_target2D=L_neg_target_xy + L_neg_target_yz + L_neg_target_zx,
+                                )
 
 
 

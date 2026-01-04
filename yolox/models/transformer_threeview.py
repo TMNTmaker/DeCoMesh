@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from yolox.models.losses import *
 import time
 from typing import Tuple
@@ -8,7 +9,8 @@ from typing import Tuple
 
 def build_2d_sincos_pos_embed(h, w, embed_dim, device=None):
     """
-    ViTでよくある2D sin-cos位置埋め込みを作る
+    2D sin-cos 位置埋め込みを作る。
+    embed_dim が 4 の倍数でない場合も、必ず (1, h*w, embed_dim) を返すようにする。
     return: (1, h*w, embed_dim)
     """
     if device is None:
@@ -21,23 +23,34 @@ def build_2d_sincos_pos_embed(h, w, embed_dim, device=None):
     grid_h = grid[0].reshape(-1)  # (H*W,)
     grid_w = grid[1].reshape(-1)
 
-    assert embed_dim % 4 == 0, "embed_dim must be divisible by 4 for 2D sincos"
-    dim_each = embed_dim // 4  # half for h, half for w
-    dim_h = dim_each
-    dim_w = dim_each
+    def _build_1d_sincos(pos_1d: torch.Tensor, dim: int) -> torch.Tensor:
+        """
+        pos_1d: (N,)
+        return: (N, dim)  (dim が奇数なら最後を 0 でパディング)
+        """
+        if dim <= 0:
+            return pos_1d.new_zeros((pos_1d.shape[0], 0))
+        half = dim // 2
+        if half == 0:
+            # dim==1 のときは 0 のみ
+            return pos_1d.new_zeros((pos_1d.shape[0], 1))
+        omega = torch.arange(half, dtype=torch.float32, device=pos_1d.device) / float(half)
+        omega = 1.0 / (10000 ** omega)  # (half,)
+        out = torch.einsum("n,d->nd", pos_1d, omega)  # (N, half)
+        emb = torch.cat([torch.sin(out), torch.cos(out)], dim=1)  # (N, 2*half)
+        if emb.shape[1] < dim:
+            emb = torch.cat([emb, emb.new_zeros((emb.shape[0], dim - emb.shape[1]))], dim=1)
+        elif emb.shape[1] > dim:
+            emb = emb[:, :dim]
+        return emb
 
-    omega_h = torch.arange(dim_h, dtype=torch.float32, device=device) / dim_h
-    omega_h = 1.0 / (10000 ** omega_h)  # (dim_h,)
+    # embed_dim を h と w に割り当て（奇数でもOK）
+    dim_h = embed_dim // 2
+    dim_w = embed_dim - dim_h
 
-    omega_w = torch.arange(dim_w, dtype=torch.float32, device=device) / dim_w
-    omega_w = 1.0 / (10000 ** omega_w)
-
-    out_h = torch.einsum("n,d->nd", grid_h, omega_h)  # (H*W, dim_h)
-    out_w = torch.einsum("n,d->nd", grid_w, omega_w)  # (H*W, dim_w)
-
-    pos_emb_h = torch.cat([torch.sin(out_h), torch.cos(out_h)], dim=1)  # (H*W, 2*dim_h)
-    pos_emb_w = torch.cat([torch.sin(out_w), torch.cos(out_w)], dim=1)  # (H*W, 2*dim_w)
-    pos_emb = torch.cat([pos_emb_h, pos_emb_w], dim=1)  # (H*W, 2*dim_h+2*dim_w) = (H*W, embed_dim)
+    pos_emb_h = _build_1d_sincos(grid_h, dim_h)  # (H*W, dim_h)
+    pos_emb_w = _build_1d_sincos(grid_w, dim_w)  # (H*W, dim_w)
+    pos_emb = torch.cat([pos_emb_h, pos_emb_w], dim=1)  # (H*W, embed_dim)
     pos_emb = pos_emb.unsqueeze(0)  # (1, H*W, C)
     return pos_emb
 
@@ -123,11 +136,11 @@ class TriViewPAFTransformer(nn.Module):
     """
     def __init__(
         self,
-        learn_uv=False,
-        feat_dim: int = 256+128*0,
+        learn_uv=True,
+        feat_dim: int = 126,#256+128*0,
         map_size: int = 80,
         num_layers: int = 3,
-        num_heads: int = 4,
+        num_heads: int = 3,
     ):
         super().__init__()
         self.learn_uv = learn_uv
@@ -165,13 +178,46 @@ class TriViewPAFTransformer(nn.Module):
         self.softplus = nn.Softplus()
 
         
-    def forward(self, feat,cls_feat):
+    def forward(self,x,cls_feat):
         """
         feat: (B, 256+128, 80, 80)
         """
+         # [B, 6*C, H, W] に畳み込んで NCHW に合わせる
+        if cls_feat is not None and cls_feat.dim() == 5:
+            # (B, V, C, H, W) に対応
+            if cls_feat.shape[0] == x.shape[0]:
+                #(B,V*C,H,W)にする
+                cls_feat = cls_feat.reshape(cls_feat.shape[0],
+                                            -1,
+                                            cls_feat.shape[3],
+                                            cls_feat.shape[4])
+                #cls_feat = cls_feat[:,:,:20].sum(dim=2) #(B,V,H,W)
+                # ソベルエッジ検出 (各チャネル独立に groups=V で適用)
+                # 期待shape: cls_feat = (B, V, H, W)  ※Vは入力チャネルとして扱う
+                c = cls_feat.shape[1]
+                sobel_x = torch.tensor(
+                    [[-1.0, 0.0, 1.0],
+                     [-2.0, 0.0, 2.0],
+                     [-1.0, 0.0, 1.0]],
+                    device=cls_feat.device,
+                    dtype=cls_feat.dtype,
+                ).view(1, 1, 3, 3).repeat(c, 1, 1, 1)
+                sobel_y = torch.tensor(
+                    [[-1.0, -2.0, -1.0],
+                     [ 0.0,  0.0,  0.0],
+                     [ 1.0,  2.0,  1.0]],
+                    device=cls_feat.device,
+                    dtype=cls_feat.dtype,
+                ).view(1, 1, 3, 3).repeat(c, 1, 1, 1)
+
+                gx = F.conv2d(cls_feat, sobel_x, bias=None, stride=1, padding=1, groups=c)
+                gy = F.conv2d(cls_feat, sobel_y, bias=None, stride=1, padding=1, groups=c)
+                cls_feat = torch.sqrt(gx * gx + gy * gy + 1e-6)        
         feat = cls_feat#torch.cat([feat,cls_feat], dim= 1)
+
+
+
         B, C, H, W = feat.shape
-        #assert H == self.map_h and W == self.map_w, "backbone出力の空間サイズとpos_embedが一致している必要があります"
 
         # (B, C, H, W) -> (B, HW, C)
         tokens = self.token_emb(feat)
@@ -267,7 +313,7 @@ class TriViewPAFTransformer(nn.Module):
 
 
 class transformer_threeviewNet(nn.Module):
-    def __init__(self,learn_uv=False):
+    def __init__(self,learn_uv=True):
         super().__init__()
         self.learn_uv = learn_uv
         self.TriViewPAFTransformer = TriViewPAFTransformer(self.learn_uv)
@@ -295,9 +341,14 @@ class transformer_threeviewNet(nn.Module):
             torch.cuda.synchronize(); t1 = time.time()
             loss_total,loss_offset,loss_target=self.loss_all(pafs,pafs_t,
                                                  masks_y,masks_t)    
+            loss_dict = {
+                #"loss_total": loss_total,
+                "loss_offset": loss_offset,
+                "loss_target": loss_target,
+            }
             torch.cuda.synchronize(); t2 = time.time()
             #print(f"Data processing time: {t1-t0:.4f}s, Loss calculation time: {t2-t1:.4f}s")
-            return loss_total,loss_offset,loss_target,pafs,features
+            return loss_total,loss_dict,pafs,features
         else:
             return pafs,features  
     
@@ -318,7 +369,7 @@ class transformer_threeviewNet(nn.Module):
         """
         device = x.device
         B, _, H, W = x.shape
-        r = float(reduction_mag)
+        rate = float(reduction_mag)
         t2 = float(thickness * thickness)  # 距離判定は2乗で
 
         # --- 内部は float32 で計算、最後に out_dtype へ変換 ---
@@ -462,18 +513,18 @@ class transformer_threeviewNet(nn.Module):
 
             # --- view ごとに 2D 座標を作って一括でエッジ描画 ---
             # xy
-            A2_xy = (A3[:, [0, 1]] / r).contiguous()
-            B2_xy = (B3[:, [0, 1]] / r).contiguous()
+            A2_xy = (A3[:, [0, 1]] / rate).contiguous()
+            B2_xy = (B3[:, [0, 1]] / rate).contiguous()
             draw_edges_view(pafs[b, 0:4], A2_xy, B2_xy)
 
             # yz
-            A2_yz = (A3[:, [1, 2]] / r).contiguous()
-            B2_yz = (B3[:, [1, 2]] / r).contiguous()
+            A2_yz = (A3[:, [1, 2]] / rate).contiguous()
+            B2_yz = (B3[:, [1, 2]] / rate).contiguous()
             draw_edges_view(pafs[b, 4:8], A2_yz, B2_yz)
 
             # zx
-            A2_zx = (A3[:, [2, 0]] / r).contiguous()
-            B2_zx = (B3[:, [2, 0]] / r).contiguous()
+            A2_zx = (A3[:, [2, 0]] / rate).contiguous()
+            B2_zx = (B3[:, [2, 0]] / rate).contiguous()
             draw_edges_view(pafs[b, 8:12], A2_zx, B2_zx)
 
         # --- ignore mask を作成（ch 合計が 0 の画素を ignore=1）---

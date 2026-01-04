@@ -19,6 +19,33 @@ def dice_loss(pred, target, eps=1e-6):
     dice = (2 * intersection + eps) / (union + eps)
     return 1 - dice.mean()
 
+def levelset_loss(pred_phi, target,mask):
+    """
+    pred_phi: 出力されたレベルセット関数 (B, 1, H, W)
+    target_mask: 正解マスク (0 or 1)
+    """
+    # 1. Segmentation Loss
+    # φ > 0 を物体、φ < 0 を背景とする (Sigmoidを通して確率化)
+    # Binary Cross Entropy または Dice Loss
+    pred_prob = pred_phi #torch.sigmoid(pred_phi)
+    
+    # target_mask が PAF (オフセット値) の場合、[0, 1] の範囲外の値が含まれるため
+    # binary_cross_entropy で CUDA assert が発生する。
+    # ここでは 0 か 1 のバイナリマスクに変換して計算する。
+    #target_mask_binary = (target_mask.abs() > 1e-5).to(dtype=pred_prob.dtype)
+    
+    #bce = F.binary_cross_entropy(pred_prob.float(), target_mask_binary.float())
+    #二乗和
+    mse = F.mse_loss(pred_prob.float(), target.float(), reduction='none')
+    mse = (mse * mask).sum() / mask.sum()
+    
+    # 2. Regularization (オプション)
+    # φ が極端な値にならないようにする
+    reg = torch.mean(pred_phi**2) * 0.001
+    
+    return mse + reg
+
+
 def masked_bce_loss(pred, target, mask):
     loss = F.binary_cross_entropy(pred, target, reduction='none')
     return (loss * mask).sum() / mask.sum()
@@ -385,9 +412,10 @@ def focal_bce_with_logits(logits, target, gamma=2.0, alpha=0.25, ignore_mask=Non
 
 def loss_sparse_vector_field(
     p_logit, v_pred, m_pos_hard, v_gt,
-    alpha=1.0, beta=0.2, lam_dir=1.0, lam_mag=1.0,
-    gamma=2.0, eps=1e-6, tau=1e-2, symmetric=False,
-    use_topk_neg: float | None = None  # 例: 0.1 で負例上位10%のみ
+    alpha=1.0, beta=1.0, lam_dir=1.0, lam_mag=1.0,
+    gamma=5.0, eps=1e-6, tau=1e-2, symmetric=False,
+    use_topk_neg: float | float = None# 例: 0.1 で負例上位10%のみ
+
 ):
     """
     p_logit: (B,1,D,H,W)
@@ -399,11 +427,11 @@ def loss_sparse_vector_field(
 
     # 1) 検出用の soft target（膨張→ガウシアン）
     m_pos_soft = make_positive_targets(
-        m_pos_hard, method="both", radius=1, sigma=1.0, alpha_soft=1.0
+        m_pos_hard, method="both", radius=3, sigma=1.0, alpha_soft=1.0
     )  # (B,1,D,H,W), [0,1]
 
     L_det = focal_bce_with_logits(
-        p_logit, m_pos_soft, gamma=gamma, alpha=0.25, ignore_mask=None
+        p_logit, m_pos_soft, gamma=gamma, alpha=0.75, ignore_mask=None
     )
 
     # 2) 回帰（GTマスク基準）。小ノルムGTは方向未定義なので除外
@@ -435,7 +463,7 @@ def loss_sparse_vector_field(
     # 3) 負例抑制（negのみ）。必要なら Top-k で間引き
     neg_mask = (~(m_pos_hard > 0)).squeeze(1)  # (B,D,H,W)
     neg_map = (v_pred.pow(2).sum(1))  # (B,D,H,W) = ||v_pred||^2
-    weight = v_pred_norm.squeeze(1).pow(gamma) # 大きい外れを強調
+    weight = v_pred_norm.squeeze(1).pow(2.0) # 大きい外れを強調
 
     neg_loss_map = weight * neg_map  # (B,D,H,W)
     if use_topk_neg is not None and 0 < use_topk_neg < 1:
@@ -462,14 +490,14 @@ def loss_sparse_vector_field(
     if L_neg is None:
         L_neg = torch.tensor(0.0, device=v_pred.device, dtype=v_pred.dtype, requires_grad=True)
 
-    L_total = L_det + alpha * L_vec + beta * L_neg
+    L_total = beta * L_det + alpha * L_vec + beta * L_neg
     return L_total, L_det, L_vec, L_neg
 
 
 
 TensorLike = Union[torch.Tensor, List, torch.Tensor]
 
-@torch.no_grad()
+#@torch.no_grad()
 def chamfer_distance(
     predict: List[List[TensorLike]],
     ground:  List[List[TensorLike]],
@@ -577,7 +605,7 @@ def chamfer_distance(
 import torch
 from typing import List, Tuple, Sequence
 
-@torch.no_grad()
+#@torch.no_grad()
 def IoU3D_voxel(
     predict: List[List[TensorLike]],
     ground:  List[List[TensorLike]],

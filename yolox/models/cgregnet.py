@@ -17,7 +17,7 @@ class TripleViewEncoder(nn.Module):
         super().__init__()
         # 共有畳み込み層
         self.conv_shared = nn.Sequential(
-            nn.Conv2d(128*2, 128, 3, padding=1),
+            nn.Conv2d(128*3, 128, 3, padding=1),
             nn.ReLU(),
             nn.Conv2d(128, 128, 3,stride=1, padding=1),
             nn.ReLU(),
@@ -119,8 +119,8 @@ class TriView2CoordGrid(nn.Module):
         self.decoder = LowRankVoxelFusion(in_channels)
 
 
-    def forward(self, x,labels=None,reduction_mag=None):
-        
+    def forward(self, x,feat,labels=None,reduction_mag=None):
+        x =torch.cat([x,feat], dim= 1)
         front, top, side = self.encoder(x)
         vector_field_y,mask_y = self.decoder(front, side,top)
         if self.training:
@@ -157,7 +157,7 @@ class TriView2CoordGrid(nn.Module):
 
             return loss,loss_dict  
         else:
-            pred=postprocess3D(vector_field_y,8)
+            pred=postprocess3D(vector_field_y,0.1)
             #groups_as_list(vector_field_y[1])
             return pred[0],pred[1]#[0],groups_as_list(vector_field_y[1])
     
@@ -302,6 +302,7 @@ class TriView2CoordGrid(nn.Module):
                 ez = Zc + tgt_z
                 d_end = torch.sqrt((ex - Px)**2 + (ey - Py)**2 + (ez - Pz)**2)
                 keep_tgt = _single_argmin_mask(d_end)
+                #keep_tgt = _k_smallest_mask(d_end,2)
                 tgt_x = tgt_x * keep_tgt
                 tgt_y = tgt_y * keep_tgt
                 tgt_z = tgt_z * keep_tgt
@@ -346,8 +347,8 @@ class TriView2CoordGrid(nn.Module):
                     predictpolygon,
                     lambda_offset=10.0,
                     lambda_target=10.0,
-                    lambda_chamfer=1.0,
-                    lambda_3dIoU=5.0
+                    lambda_chamfer=0.25,
+                    lambda_3dIoU=2.0
                     ):
         torch.cuda.synchronize(); t2 = time.time()
         loss_chamfer = chamfer_distance(predictpolygon, groundpolygon)
@@ -358,32 +359,27 @@ class TriView2CoordGrid(nn.Module):
         #offset
         loss_offset,L_det_offset,L_vec_offset,L_neg_offset =\
             loss_sparse_vector_field(mask_y[:,[0]], vector_field_y[:, [0,1,2]], 
-                                 mask_t[:,[0]], vector_field_t[:, [0,1,2]], 
-                             alpha=1.0, beta=0.2, lam_dir=1.0, 
-                             lam_mag=1.0, gamma=2.0, eps=1e-6)
+                                 mask_t[:,[0]], vector_field_t[:, [0,1,2]])
         #target
         loss_target,L_det_target,L_vec_target,L_neg_target =\
             loss_sparse_vector_field(mask_y[:,[1]], vector_field_y[:, [3,4,5]], 
-                                 mask_t[:,[1]], vector_field_t[:, [3,4,5]], 
-                             alpha=1.0, beta=0.2, lam_dir=1.0, 
-                             lam_mag=1.0, gamma=2.0, eps=1e-6)
+                                 mask_t[:,[1]], vector_field_t[:, [3,4,5]])
         
         
 
-        loss_total = loss_offset + loss_target  
-        #+lambda_chamfer*torch.log(loss_chamfer) + lambda_3dIoU*loss_IoU3D
+        loss_total =  lambda_offset*loss_offset + lambda_target*loss_target +lambda_chamfer*loss_chamfer 
 
         
         
-        return loss_total,dict(loss_offset=loss_offset,
-                               loss_det_offset= L_det_offset,
-                               loss_vec_offset=L_vec_offset,
-                               loss_neg_offset=L_neg_offset,
+        return loss_total,dict(loss_offset3D=loss_offset,
+                               loss_det_offset3D= L_det_offset,
+                               loss_vec_offset3D=L_vec_offset,
+                               loss_neg_offset3D=L_neg_offset,
                         
-                               loss_target=loss_target,       
-                               loss_det_target= L_det_target,
-                               loss_vec_target=L_vec_target,
-                               loss_neg_target=L_neg_target,
+                               loss_target3D=loss_target,       
+                               loss_det_target3D= L_det_target,
+                               loss_vec_target3D=L_vec_target,
+                               loss_neg_target3D=L_neg_target,
                                
                                loss_chamfer=loss_chamfer, 
                                loss_IoU3D=loss_IoU3D,)
