@@ -325,6 +325,8 @@ datasets/
 export YOLOX_DATADIR=/path/to/your/datasets
 ```
 
+アノテーション JSON の詳細な仕様、座標系の扱い、クラス定義については [`datasets/README.md`](datasets/README.md) を参照してください。
+
 ### 4. 学習
 
 ```bash
