@@ -6,7 +6,7 @@
 物体検出フレームワーク [YOLOX (Megvii)](https://github.com/Megvii-BaseDetection/YOLOX) をベースに、3D再構築タスク向けにモデル・損失関数・データローダ・評価指標を独自に実装・拡張したものです。
 
 <div align="center">
-  <img src="vector_field_three_views.png" width="80%"><br>
+  <img src="assets/results/vector_field_three_views.png" width="80%"><br>
   <sub>三面図（xy / yz / zx）上に投影した Offset / Target ベクトル場の可視化</sub>
 </div>
 
@@ -234,7 +234,7 @@ RGB 640×640
 ### 復元アルゴリズム：動作を確認
 
 <div align="center">
-  <img src="mesh_visual_vf.png" width="80%"><br>
+  <img src="assets/results/mesh_visual_vf.png" width="80%"><br>
   <sub>ベクトル場からのメッシュ復元結果</sub>
 </div>
 
@@ -248,8 +248,8 @@ RGB 640×640
 - **MeshNet / TriView2CoordGrid** は**アンダーフィッティング**。ClassNet の特徴から潜在的にエッジ情報を取り出し、Sparse Vector Field Loss で疎なベクトル場を表現できると期待したが、**このアーキテクチャ／損失設計では表現を習得できなかった**
 
 <div align="center">
-  <img src="semantic_segmentation_targets_0.png" width="45%">
-  <img src="semantic_segmentation_targets_3.png" width="45%"><br>
+  <img src="assets/results/semantic_segmentation_targets_0.png" width="45%">
+  <img src="assets/results/semantic_segmentation_targets_3.png" width="45%"><br>
   <sub>ClassNet の学習ターゲット（多方向投影セグメンテーション）</sub>
 </div>
 
@@ -388,6 +388,7 @@ DeCoMesh/
 │   ├── default/yolo3D.py             # CSPDarknet ベースの設定
 │   └── example/custom/yolox3d_sun.py # SUN RGB-D 学習用の設定
 ├── tools/                            # train / eval / demo / export スクリプト
+├── assets/results/                   # README で参照する検証結果の図
 ├── vis/                              # ベクトル場・中間表現の可視化結果
 └── 深層学習による疎なメッシュの高速3D再構築.pdf  # 研究レポート
 ```
